@@ -1,9 +1,11 @@
 """
-Unified Particle Detection Gallery
-All-in-one: summary table + gallery + mass edit + full image zoom/pan
-KEY: Click particles to zoom into full image with pan controls
+Unified Particle Detection Gallery - WITH BOUNDS VISUALIZATION
+Shows the exact bounding box used for sizing on each particle preview
 
-UPDATED: scipy edge detection for accurate sizing
+Updated with:
+- Bounds stored from edge detection
+- Green rectangle overlay on gallery previews showing where size comes from
+- Size method (edge_detect, mask_bounds, bbox) displayed
 
 Usage:
     streamlit run particle_review_gallery_unified.py
@@ -12,7 +14,7 @@ Usage:
 import streamlit as st
 import cv2
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 import pandas as pd
 import os
 import tempfile
@@ -23,6 +25,7 @@ import plotly.graph_objects as go
 import plotly.express as px
 import base64
 from scipy import ndimage
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG
@@ -51,7 +54,7 @@ CLASS_COLORS = {
     "Other": (0, 0, 255),
 }
 
-st.set_page_config(page_title="Particle Detection Review", page_icon="icon.ico", layout="wide")
+st.set_page_config(page_title="dirt sniffer", page_icon="icon.ico", layout="wide")
 
 with open("icon.png", "rb") as f:
     img = base64.b64encode(f.read()).decode()
@@ -65,13 +68,11 @@ st.markdown(f"""
 
 st.divider()
 
-
 @st.cache_resource
 def load_model():
     if not os.path.exists(MODEL_PATH):
         return None
     return YOLO(MODEL_PATH)
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # UTILITIES
@@ -106,7 +107,7 @@ def resize_image_for_display(image_array, max_height=1080):
 def calculate_particle_size_accurate(mask_array, calibration):
     """
     Calculate accurate particle size using scipy edge detection
-    Returns: diameter_um, method
+    Returns: diameter_um, method, bounds (x_min, y_min, x_max, y_max)
     """
 
     # Method 1: Edge detection within mask
@@ -127,7 +128,7 @@ def calculate_particle_size_accurate(mask_array, calibration):
 
             diameter_pixels = max(x_max - x_min + 1, y_max - y_min + 1)
             diameter_um = diameter_pixels * calibration
-            return round(diameter_um, 1), "edge_detect"
+            return round(diameter_um, 1), "edge_detect", (int(x_min), int(y_min), int(x_max), int(y_max))
     except:
         pass
 
@@ -140,12 +141,12 @@ def calculate_particle_size_accurate(mask_array, calibration):
 
             diameter_pixels = max(x_max - x_min + 1, y_max - y_min + 1)
             diameter_um = diameter_pixels * calibration
-            return round(diameter_um, 1), "mask_bounds"
+            return round(diameter_um, 1), "mask_bounds", (int(x_min), int(y_min), int(x_max), int(y_max))
     except:
         pass
 
     # Fallback (shouldn't reach here)
-    return None, "failed"
+    return None, "failed", None
 
 
 def process_image(image_path, model):
@@ -179,8 +180,8 @@ def process_image(image_path, model):
             except:
                 mask_array = None
 
-            # Calculate size using edge detection
-            diameter_um, size_method = calculate_particle_size_accurate(
+            # Calculate size using edge detection (now returns bounds too!)
+            diameter_um, size_method, bounds = calculate_particle_size_accurate(
                 mask_array, CALIBRATION_UM_PER_PIXEL
             )
 
@@ -188,6 +189,7 @@ def process_image(image_path, model):
                 # Fallback to bbox
                 diameter_um = max(box_w, box_h) * CALIBRATION_UM_PER_PIXEL
                 size_method = "bbox"
+                bounds = (x1, y1, x2, y2)
 
             is_black = is_black_background(image, x1, y1, box_w, box_h)
 
@@ -197,6 +199,7 @@ def process_image(image_path, model):
                 "diameter_um": diameter_um,
                 "size_bin": get_size_bin(diameter_um),
                 "size_method": size_method,
+                "bounds": bounds,  # ← NEW! Bounds for visualization
                 "deleted": False,
                 "black_bg": is_black
             })
@@ -414,9 +417,32 @@ else:
                     y1 = max(0, y - margin)
                     x2 = min(img_np.shape[1], x + w + margin)
                     y2 = min(img_np.shape[0], y + h + margin)
-                    crop = img_np[y1:y2, x1:x2]
+                    crop = img_np[y1:y2, x1:x2].copy()
 
-                    # Display crop
+                    # DRAW BOUNDS on the crop!
+                    if p.get("bounds") is not None:
+                        try:
+                            crop_pil = Image.fromarray(crop.astype(np.uint8)).convert('RGB')
+                            draw = ImageDraw.Draw(crop_pil)
+
+                            # Convert bounds from full image coords to crop coords
+                            bounds_x1, bounds_y1, bounds_x2, bounds_y2 = p["bounds"]
+
+                            # Shift to crop coordinates
+                            cx1 = max(0, bounds_x1 - x1)
+                            cy1 = max(0, bounds_y1 - y1)
+                            cx2 = min(crop.shape[1], bounds_x2 - x1)
+                            cy2 = min(crop.shape[0], bounds_y2 - y1)
+
+                            # Draw green rectangle
+                            if cx1 < cx2 and cy1 < cy2:
+                                draw.rectangle([(cx1, cy1), (cx2, cy2)], outline=(0, 255, 0), width=2)
+
+                            crop = np.array(crop_pil)
+                        except:
+                            pass
+
+                    # Display crop with bounds drawn
                     st.image(crop, use_column_width=True, caption=f"{p['diameter_um']}µm")
 
                     # Info with sizing method
