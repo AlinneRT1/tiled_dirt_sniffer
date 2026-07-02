@@ -427,7 +427,7 @@ else:
                 # Draw bright blue box
                 crop_pil = Image.fromarray(crop).convert('RGB')
                 draw = ImageDraw.Draw(crop_pil)
-                draw.rectangle([(x-x1, y-y1), (x+w-x1, y+h-y1)], outline=(0, 100, 255), width=2)
+                draw.rectangle([(x-x1, y-y1), (x+w-x1, y+h-y1)], outline=(128, 178, 255), width=2)
                 crop = np.array(crop_pil)
 
                 # Display
