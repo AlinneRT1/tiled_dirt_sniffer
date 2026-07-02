@@ -29,8 +29,8 @@ from copy import deepcopy
 import plotly.graph_objects as go
 from scipy import ndimage
 
-st.set_page_config(page_title="Tiled Particle Detection", layout="wide")
-st.title("🧹 Tiled Particle Detection Gallery")
+st.set_page_config(page_title="tiled dirt sniffer", layout="wide")
+st.title("🐕 tiled_dirt_sniffer: Review Dashboard")
 
 # CONFIG
 MODEL_PATH = "models/best.pt"
@@ -48,17 +48,20 @@ SIZE_BINS = [
     ("J: 1000μm+", 1000, float("inf")),
 ]
 
+
 @st.cache_resource
 def load_model():
     if not os.path.exists(MODEL_PATH):
         return None
     return YOLO(MODEL_PATH)
 
+
 def get_size_bin(diameter_um):
     for label, lo, hi in SIZE_BINS:
         if lo <= diameter_um < hi:
             return label
     return "K"
+
 
 def calculate_particle_size_accurate(mask_array, calibration):
     """Edge detection sizing"""
@@ -86,6 +89,7 @@ def calculate_particle_size_accurate(mask_array, calibration):
         pass
 
     return None, "failed"
+
 
 def detect_particles_in_tiles(tile_files, tile_metadata, model):
     """Detect in all tiles (loads from uploaded files)"""
@@ -161,6 +165,7 @@ def detect_particles_in_tiles(tile_files, tile_metadata, model):
     status.empty()
     return all_particles
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SESSION STATE
 # ─────────────────────────────────────────────────────────────────────────────
@@ -176,8 +181,10 @@ if "tile_metadata" not in st.session_state:
 if "tile_files" not in st.session_state:
     st.session_state.tile_files = {}
 
+
 def push_undo():
     st.session_state.undo_stack.append(deepcopy(st.session_state.results))
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SIDEBAR
@@ -283,8 +290,8 @@ else:
     for cls in ["Fiber", "Glass", "Metallic", "Other"]:
         data[cls] = {}
         for b, _, _ in SIZE_BINS:
-            count = sum(len([p for p in st.session_state.results
-                            if p["class"] == cls and p["size_bin"] == b and not p.get("deleted")]))
+            count = len([p for p in st.session_state.results
+                         if p["class"] == cls and p["size_bin"] == b and not p.get("deleted")])
             data[cls][b] = count
 
     rows = []
@@ -374,7 +381,7 @@ else:
                 # Draw green box
                 crop_pil = Image.fromarray(crop).convert('RGB')
                 draw = ImageDraw.Draw(crop_pil)
-                draw.rectangle([(x-x1, y-y1), (x+w-x1, y+h-y1)], outline=(255, 75, 75), width=2)
+                draw.rectangle([(x - x1, y - y1), (x + w - x1, y + h - y1)], outline=(255, 75, 75), width=2)
                 crop = np.array(crop_pil)
 
                 # Display
