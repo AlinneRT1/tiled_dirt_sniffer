@@ -45,20 +45,17 @@ SIZE_BINS = [
     ("J: 1000μm+", 1000, float("inf")),
 ]
 
-
 @st.cache_resource
 def load_model():
     if not os.path.exists(MODEL_PATH):
         return None
     return YOLO(MODEL_PATH)
 
-
 def get_size_bin(diameter_um):
     for label, lo, hi in SIZE_BINS:
         if lo <= diameter_um < hi:
             return label
     return "K"
-
 
 def load_tile_metadata(tiles_dir):
     """Load tile metadata from manifest.json"""
@@ -71,8 +68,7 @@ def load_tile_metadata(tiles_dir):
     else:
         return None
 
-
-def detect_particles_in_tiles(tiles_dir, tile_metadata, model):
+def detect_particles_in_tiles(tile_metadata, model, tile_images_cache):
     """Detect particles in all tiles"""
     all_tile_particles = []
     progress_bar = st.progress(0)
@@ -84,22 +80,18 @@ def detect_particles_in_tiles(tiles_dir, tile_metadata, model):
 
         status.text(f"Processing {idx + 1}/{len(tile_metadata)}: {tile_filename}")
 
-        tile_path = os.path.join(tiles_dir, tile_filename)
-
-        if not os.path.exists(tile_path):
-            st.warning(f"Tile not found: {tile_path}")
+        # Load tile from cache
+        if tile_filename not in tile_images_cache:
+            st.warning(f"Tile not in cache: {tile_filename}")
             progress_bar.progress((idx + 1) / len(tile_metadata))
             continue
 
-        # Load tile
+        # Get tile from cache (already RGB numpy array)
         try:
-            img_pil = Image.open(tile_path)
-            if img_pil.mode != 'RGB':
-                img_pil = img_pil.convert('RGB')
-            tile_img = np.array(img_pil)
-            tile_img = cv2.cvtColor(tile_img, cv2.COLOR_RGB2BGR)
+            tile_img_rgb = tile_images_cache[tile_filename]
+            tile_img = cv2.cvtColor(tile_img_rgb, cv2.COLOR_RGB2BGR)
         except Exception as e:
-            st.warning(f"Failed to load {tile_filename}: {e}")
+            st.warning(f"Failed to process {tile_filename}: {e}")
             progress_bar.progress((idx + 1) / len(tile_metadata))
             continue
 
@@ -145,7 +137,6 @@ def detect_particles_in_tiles(tiles_dir, tile_metadata, model):
     status.empty()
     return all_tile_particles
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # SESSION STATE
 # ─────────────────────────────────────────────────────────────────────────────
@@ -161,30 +152,76 @@ if "tile_metadata" not in st.session_state:
 if "tile_images_cache" not in st.session_state:
     st.session_state.tile_images_cache = {}
 
-
 def push_undo():
     st.session_state.undo_stack.append(deepcopy(st.session_state.results))
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SIDEBAR
 # ─────────────────────────────────────────────────────────────────────────────
 
 with st.sidebar:
-    st.header("📂 Tiles Directory")
+    st.header("📤 Upload Tiles")
 
-    tiles_dir = st.text_input("Path to tiles:", "/path/to/tiles")
+    upload_type = st.radio("Upload:", ["ZIP file", "Individual tiles"])
 
-    if st.button("📋 Load Metadata"):
-        if os.path.exists(tiles_dir):
-            tile_metadata = load_tile_metadata(tiles_dir)
-            if tile_metadata:
+    if upload_type == "ZIP file":
+        zip_file = st.file_uploader("Upload tiles.zip", type=["zip"])
+
+        if zip_file and st.button("📋 Extract & Load"):
+            import zipfile
+            import tempfile
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                with zipfile.ZipFile(zip_file) as z:
+                    z.extractall(tmpdir)
+
+                # Find manifest.json
+                manifest_path = None
+                for root, dirs, files in os.walk(tmpdir):
+                    if "manifest.json" in files:
+                        manifest_path = os.path.join(root, "manifest.json")
+                        break
+
+                if manifest_path:
+                    with open(manifest_path) as f:
+                        manifest = json.load(f)
+
+                    tile_metadata = manifest.get("tiles", [])
+
+                    # Cache tile images
+                    for tile in tile_metadata:
+                        tile_path = os.path.join(os.path.dirname(manifest_path), tile["filename"])
+                        if os.path.exists(tile_path):
+                            img = Image.open(tile_path).convert('RGB')
+                            st.session_state.tile_images_cache[tile["filename"]] = np.array(img)
+
+                    st.session_state.tile_metadata = tile_metadata
+                    st.success(f"✅ Loaded {len(tile_metadata)} tiles")
+                else:
+                    st.error("manifest.json not found in ZIP")
+
+    else:  # Individual tiles
+        tile_files = st.file_uploader(
+            "Upload tile images",
+            type=["jpg", "jpeg", "png", "tif"],
+            accept_multiple_files=True
+        )
+        manifest_file = st.file_uploader("Upload manifest.json", type=["json"])
+
+        if tile_files and manifest_file and st.button("📋 Load"):
+            try:
+                manifest = json.load(manifest_file)
+                tile_metadata = manifest.get("tiles", [])
+
+                # Cache uploaded tiles
+                for tile_file in tile_files:
+                    img = Image.open(tile_file).convert('RGB')
+                    st.session_state.tile_images_cache[tile_file.name] = np.array(img)
+
                 st.session_state.tile_metadata = tile_metadata
                 st.success(f"✅ Loaded {len(tile_metadata)} tiles")
-            else:
-                st.error("No manifest.json found")
-        else:
-            st.error(f"Directory not found: {tiles_dir}")
+            except Exception as e:
+                st.error(f"Error: {e}")
 
     st.divider()
 
@@ -198,7 +235,7 @@ with st.sidebar:
             else:
                 # Detect in all tiles
                 tile_particles = detect_particles_in_tiles(
-                    tiles_dir, st.session_state.tile_metadata, model
+                    st.session_state.tile_metadata, model, st.session_state.tile_images_cache
                 )
                 st.success(f"Found {len(tile_particles)} raw detections")
 
@@ -207,7 +244,6 @@ with st.sidebar:
 
                 # Save metadata temporarily for TileParticleManager
                 import tempfile
-
                 with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
                     # Convert to TileParticleManager format
                     mgr_metadata = []
@@ -323,12 +359,11 @@ else:
         cols = st.columns(6)
         for i, (pidx, p) in enumerate(page_particles):
             with cols[i % 6]:
-                # Load tile image
+                # Get tile from cache
                 tile_filename = p["tile_filename"]
                 if tile_filename not in st.session_state.tile_images_cache:
-                    tile_path = os.path.join(tiles_dir, tile_filename)
-                    tile_img = Image.open(tile_path).convert('RGB')
-                    st.session_state.tile_images_cache[tile_filename] = np.array(tile_img)
+                    st.warning(f"Tile not found: {tile_filename}")
+                    continue
 
                 tile_np = st.session_state.tile_images_cache[tile_filename]
 
