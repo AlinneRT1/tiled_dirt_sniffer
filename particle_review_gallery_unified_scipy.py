@@ -38,16 +38,17 @@ MODEL_PATH = "models/best.pt"
 CALIBRATION_UM_PER_PIXEL = 1.299
 
 SIZE_BINS = [
-    ("B: 5-15μm", 5, 15),
-    ("C: 15-25μm", 15, 25),
-    ("D: 25-50μm", 25, 50),
-    ("E: 50-100μm", 50, 100),
-    ("F: 100-250μm", 100, 250),
-    ("G: 250-500μm", 250, 500),
-    ("H: 500-750μm", 500, 750),
-    ("I: 750-1000μm", 750, 1000),
-    ("J: 1000μm+", 1000, float("inf")),
+    ("B: 5-15μm (1519 pcs)", 5, 15),
+    ("C: 15-25μm (186 pcs)", 15, 25),
+    ("D: 25-50μm (67 pcs)", 25, 50),
+    ("E: 50-100μm (9 pcs)", 50, 100),
+    ("F: 100-250μm (1 pcs)", 100, 250),
+    ("G: 250-500μm (0 pcs)", 250, 500),
+    ("H: 500-750μm (0 pcs)", 500, 750),
+    ("I: 750-1000μm (0 pcs)", 750, 1000),
+    ("J: 1000μm+ (0 pcs)", 1000, float("inf")),
 ]
+
 
 @st.cache_resource
 def load_model():
@@ -55,11 +56,13 @@ def load_model():
         return None
     return YOLO(MODEL_PATH)
 
+
 def get_size_bin(diameter_um):
     for label, lo, hi in SIZE_BINS:
         if lo <= diameter_um < hi:
             return label
     return "K"
+
 
 def calculate_particle_size_accurate(mask_array, calibration):
     """Edge detection sizing"""
@@ -88,7 +91,49 @@ def calculate_particle_size_accurate(mask_array, calibration):
 
     return None, "failed"
 
-def detect_particles_in_tiles(tile_files, tile_metadata, model):
+
+def stitch_merged_particle(tile_files, p):
+    """Stitch together tiles for a merged cut particle"""
+
+    if not p.get("merged"):
+        return None
+
+    try:
+        # Get original particles that were merged
+        originals = p.get("original_particles", [])
+        if len(originals) < 2:
+            return None
+
+        # Load both tile images
+        images = []
+        for orig in originals:
+            filename = orig["tile_filename"]
+            if filename not in tile_files:
+                return None
+
+            file_obj = tile_files[filename]
+            tile_img = Image.open(file_obj).convert('RGB')
+            images.append(np.array(tile_img))
+
+        if len(images) < 2:
+            return None
+
+        # Get positions of original particles
+        img1, img2 = images[0], images[1]
+        p1, p2 = originals[0], originals[1]
+
+        # Simple stitch: side by side or top to bottom
+        # Check which direction to stitch based on position
+        if p1["tile_filename"] < p2["tile_filename"]:  # Rough ordering
+            # Horizontal stitch (left-right)
+            stitched = np.concatenate([img1, img2], axis=1)
+        else:
+            # Vertical stitch (top-bottom)
+            stitched = np.concatenate([img1, img2], axis=0)
+
+        return stitched
+    except:
+        return None
     """Detect in all tiles (loads from uploaded files)"""
     all_particles = []
     progress_bar = st.progress(0)
@@ -162,6 +207,7 @@ def detect_particles_in_tiles(tile_files, tile_metadata, model):
     status.empty()
     return all_particles
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SESSION STATE
 # ─────────────────────────────────────────────────────────────────────────────
@@ -177,8 +223,10 @@ if "tile_metadata" not in st.session_state:
 if "tile_files" not in st.session_state:
     st.session_state.tile_files = {}
 
+
 def push_undo():
     st.session_state.undo_stack.append(deepcopy(st.session_state.results))
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SIDEBAR
@@ -257,11 +305,31 @@ with st.sidebar:
                     manager = TileParticleManager(metadata_file, iou_threshold=0.3, seam_margin=30)
                     dedup_particles, stats = manager.process_tile_particles(raw_particles)
 
-                    st.write(f"✅ After dedup: {stats['after_dedup']}")
-                    st.write(f"   Removed: {stats['duplicates_removed']}")
-                    st.write(f"   At seams: {stats['at_seams']}")
+                    # Attempt to merge cut particles across seams
+                    st.write("Merging cut particles...")
+                    merged_particles, merged_pairs = manager.merge_cut_particles(dedup_particles)
 
-                    st.session_state.results = dedup_particles
+                    st.write(f"✅ After dedup: {stats['after_dedup']}")
+                    st.write(f"   Removed: {stats['duplicates_removed']} duplicates (same particle, different tiles)")
+                    st.write(f"   At seams: {stats['at_seams']} (potential cut particles)")
+                    st.write(f"   Merged: {len(merged_pairs)} (stitched together)")
+
+                    with st.expander("ℹ️ Deduplication Details"):
+                        st.write("""
+                        **What happens:**
+                        1. Each tile is detected independently
+                        2. Overlapping detections are compared using IOU (Intersection over Union)
+                        3. If IOU > 0.3, they're considered the same particle → keep only ONE
+                        4. Particles near tile edges are marked as "at_seam"
+                        5. Paired seam particles are stitched together if they match
+
+                        **Confidence:**
+                        - Duplicates identified by IOU > 0.3 (30% overlap)
+                        - Only ONE copy kept in final report
+                        - Merged particles show both original positions
+                        """)
+
+                    st.session_state.results = merged_particles
 
                 except ImportError:
                     st.warning("TileParticleManager not found, using raw detections")
@@ -295,12 +363,16 @@ with st.sidebar:
             rows = []
             for p in st.session_state.results:
                 if not p.get("deleted"):
+                    status = "MERGED (stitched)" if p.get("merged") else (
+                        "AT_SEAM (check)" if p.get("at_seam") else "OK")
                     rows.append({
                         "tile": p["tile_filename"],
                         "class": p["class"],
                         "diameter_um": p["diameter_um"],
+                        "size_bin": p["size_bin"],
                         "size_method": p["size_method"],
                         "confidence": round(p["confidence"], 3),
+                        "status": status,
                     })
 
             df = pd.DataFrame(rows)
@@ -330,21 +402,26 @@ else:
         data[cls] = {}
         for b, _, _ in SIZE_BINS:
             count = len([p for p in st.session_state.results
-                        if p["class"] == cls and p["size_bin"] == b and not p.get("deleted")])
+                         if p["class"] == cls and p["size_bin"] == b and not p.get("deleted")])
             data[cls][b] = count
 
     rows = []
     for cls in ["Fiber", "Glass", "Metallic", "Other"]:
         row = {"Material": cls}
-        total = 0
         for b, _, _ in SIZE_BINS:
             c = data[cls][b]
             row[b] = c
-            total += c
-        row["Total"] = total
         rows.append(row)
 
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, height=150)
+    # Add totals row
+    totals_row = {"Material": "TOTAL"}
+    for b, _, _ in SIZE_BINS:
+        total = sum(data[cls][b] for cls in ["Fiber", "Glass", "Metallic", "Other"])
+        totals_row[b] = total
+    rows.append(totals_row)
+
+    df = pd.DataFrame(rows)
+    st.dataframe(df, use_container_width=True, height=200)
 
     st.divider()
 
@@ -354,7 +431,7 @@ else:
 
     st.subheader("🖼️ Particle Gallery")
 
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
     with col1:
         filter_class = st.multiselect(
             "Class:",
@@ -372,6 +449,8 @@ else:
     with col3:
         show_seams_only = st.checkbox("Seams only")
     with col4:
+        show_merged_only = st.checkbox("Merged only")
+    with col5:
         items_per_page = st.selectbox("Per page:", [12, 18, 24, 36], index=0)
 
     # Filter particles
@@ -379,6 +458,8 @@ else:
     for idx, p in enumerate(st.session_state.results):
         if not p.get("deleted") and p["class"] in filter_class and p["size_bin"] in filter_bins:
             if show_seams_only and not p.get("at_seam"):
+                continue
+            if show_merged_only and not p.get("merged"):
                 continue
             all_particles.append((idx, p))
 
@@ -427,7 +508,7 @@ else:
                 # Draw bright blue box
                 crop_pil = Image.fromarray(crop).convert('RGB')
                 draw = ImageDraw.Draw(crop_pil)
-                draw.rectangle([(x-x1, y-y1), (x+w-x1, y+h-y1)], outline=(128, 178, 255), width=2)
+                draw.rectangle([(x - x1, y - y1), (x + w - x1, y + h - y1)], outline=(0, 100, 255), width=2)
                 crop = np.array(crop_pil)
 
                 # Display
@@ -435,12 +516,15 @@ else:
 
                 # Caption with size bin and sizing method
                 method = p["size_method"]
-                method_icon = {"edge_detect": "✨", "mask_bounds": "📊", "bbox": "📦"}
 
                 caption = f"{p['class']} | {p['size_bin']}\n{p['diameter_um']:.1f}µm\n({method})"
 
+                # Mark merged particles
+                if p.get("merged"):
+                    caption = f"🔗 MERGED\n{caption}\n✅ Cut particle stitched"
+
                 # Add seam warning if applicable
-                if p.get("at_seam"):
+                if p.get("at_seam") and not p.get("merged"):
                     caption += f"\n⚠️ At seams: {p.get('seams', [])}"
 
                 st.caption(caption)
@@ -480,50 +564,71 @@ else:
             if st.session_state.get(f"show_full_{pidx}", False):
                 filename = p["tile_filename"]
 
-                with st.expander(f"Full Image: {filename}", expanded=True):
-                    if filename not in st.session_state.tile_files:
-                        st.warning("Tile missing")
-                        continue
+                # Check if merged - show stitched image
+                if p.get("merged"):
+                    with st.expander(f"🔗 MERGED PARTICLE: {filename}", expanded=True):
+                        st.info("✅ This particle was detected as cut across tile seams and merged together")
 
-                    try:
-                        file_obj = st.session_state.tile_files[filename]
-                        tile_img = Image.open(file_obj).convert('RGB')
-                        tile_img = np.array(tile_img)
-                    except:
-                        st.warning("Load error")
-                        continue
+                        # Try to stitch
+                        stitched = stitch_merged_particle(st.session_state.tile_files, p)
 
-                    # Create Plotly figure
-                    fig = go.Figure()
-                    fig.add_trace(go.Image(z=tile_img, name="Image"))
+                        if stitched is not None:
+                            st.image(stitched, use_column_width=True, caption="Stitched together from multiple tiles")
 
-                    # Highlight particle with bright blue box
-                    x, y, w, h = p["x"], p["y"], p["w"], p["h"]
-                    fig.add_shape(
-                        type="rect",
-                        x0=x, y0=y, x1=x + w, y1=y + h,
-                        line=dict(color="rgb(0, 100, 255)", width=3)
-                    )
+                        col1, col2, col3, col4 = st.columns(4)
+                        with col1:
+                            st.write(f"**Class:** {p['class']}")
+                        with col2:
+                            st.write(f"**Size:** {p['diameter_um']}µm ({p['size_bin']})")
+                        with col3:
+                            st.write(f"**Method:** {p['size_method']}")
+                        with col4:
+                            st.write(f"**Tiles:** {len(p.get('original_particles', []))}")
 
-                    fig.update_layout(
-                        title=f"{filename} | {p['class']} ({p['size_bin']}) {p['diameter_um']}µm [{p['size_method']}]",
-                        showlegend=False,
-                        hovermode="closest",
-                        margin=dict(b=0, l=0, r=0, t=40),
-                        height=600,
-                    )
-                    fig.update_xaxes(scaleanchor="y", scaleratio=1)
-                    fig.update_yaxes(scaleanchor="x", scaleratio=1)
+                # Normal single-tile view
+                elif filename not in st.session_state.tile_files:
+                    st.warning("Tile missing")
+                else:
+                    with st.expander(f"Full Image: {filename}", expanded=True):
+                        try:
+                            file_obj = st.session_state.tile_files[filename]
+                            tile_img = Image.open(file_obj).convert('RGB')
+                            tile_img = np.array(tile_img)
+                        except:
+                            st.warning("Load error")
+                            continue
 
-                    st.plotly_chart(fig, use_container_width=True)
+                        # Create Plotly figure
+                        fig = go.Figure()
+                        fig.add_trace(go.Image(z=tile_img, name="Image"))
 
-                    col1, col2, col3 = st.columns(3)
-                    with col1:
-                        st.write(f"**Class:** {p['class']}")
-                    with col2:
-                        st.write(f"**Size:** {p['diameter_um']}µm ({p['size_bin']})")
-                    with col3:
-                        st.write(f"**Method:** {p['size_method']}")
+                        # Highlight particle with bright blue box
+                        x, y, w, h = p["x"], p["y"], p["w"], p["h"]
+                        fig.add_shape(
+                            type="rect",
+                            x0=x, y0=y, x1=x + w, y1=y + h,
+                            line=dict(color="rgb(0, 100, 255)", width=3)
+                        )
+
+                        fig.update_layout(
+                            title=f"{filename} | {p['class']} ({p['size_bin']}) {p['diameter_um']}µm [{p['size_method']}]",
+                            showlegend=False,
+                            hovermode="closest",
+                            margin=dict(b=0, l=0, r=0, t=40),
+                            height=600,
+                        )
+                        fig.update_xaxes(scaleanchor="y", scaleratio=1)
+                        fig.update_yaxes(scaleanchor="x", scaleratio=1)
+
+                        st.plotly_chart(fig, use_container_width=True)
+
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            st.write(f"**Class:** {p['class']}")
+                        with col2:
+                            st.write(f"**Size:** {p['diameter_um']}µm ({p['size_bin']})")
+                        with col3:
+                            st.write(f"**Method:** {p['size_method']}")
 
     st.divider()
 
