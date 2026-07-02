@@ -1,16 +1,19 @@
 """
-Tiled Particle Detection Gallery - LAZY LOADING
-Loads tiles on-demand instead of caching all at once
-Based on particle_review_gallery_unified.py pattern
+Tiled Particle Detection Gallery - FULL FEATURED
+All features: summary table, gallery, full image zoom, individual edits,
+mass edit, undo, sizing method display, bounding boxes
 
 Features:
-- Upload ZIP with tiles + manifest
-- Detect particles (loads tiles one at a time)
-- Gallery with 6-column layout
-- Mass edit + individual edits
-- Expanded zoom/pan view
+- Summary table (class × size bin)
+- 6-column gallery with pagination
+- Green bounding boxes on previews
+- Sizing method display (edge_detect, mask_bounds, bbox)
+- Full image zoom/pan with Plotly
+- Individual class editing
+- Delete individual particles
+- Select + mass edit
+- Undo stack
 - CSV export
-- Undo
 """
 
 import streamlit as st
@@ -196,14 +199,9 @@ with st.sidebar:
 
     if manifest_file and tile_files and st.button("📋 Load"):
         try:
-            # Load manifest
             manifest = json.load(manifest_file)
             tile_metadata = manifest.get("tiles", [])
 
-            st.write(f"✅ Manifest: {len(tile_metadata)} tiles")
-            st.write(f"✅ Uploaded: {len(tile_files)} files")
-
-            # Create mapping of filename -> file object
             file_map = {f.name: f for f in tile_files}
 
             st.session_state.tile_metadata = tile_metadata
@@ -212,8 +210,6 @@ with st.sidebar:
             st.success(f"✅ Ready to detect!")
         except Exception as e:
             st.error(f"Error: {e}")
-            import traceback
-            st.write(traceback.format_exc())
 
     st.divider()
 
@@ -275,11 +271,43 @@ with st.sidebar:
 # ─────────────────────────────────────────────────────────────────────────────
 
 if st.session_state.results is None:
-    st.info("👈 Upload ZIP and run inference")
+    st.info("👈 Upload tiles and run inference")
 else:
+    # ─────────────────────────────────────────────────────────────────────────
+    # SUMMARY TABLE
+    # ─────────────────────────────────────────────────────────────────────────
+
+    st.subheader("📊 Summary Table")
+
+    data = {}
+    for cls in ["Fiber", "Glass", "Metallic", "Other"]:
+        data[cls] = {}
+        for b, _, _ in SIZE_BINS:
+            count = sum(len([p for p in st.session_state.results
+                            if p["class"] == cls and p["size_bin"] == b and not p.get("deleted")]))
+            data[cls][b] = count
+
+    rows = []
+    for cls in ["Fiber", "Glass", "Metallic", "Other"]:
+        row = {"Material": cls}
+        total = 0
+        for b, _, _ in SIZE_BINS:
+            c = data[cls][b]
+            row[b] = c
+            total += c
+        row["Total"] = total
+        rows.append(row)
+
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, height=150)
+
+    st.divider()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # GALLERY
+    # ─────────────────────────────────────────────────────────────────────────
+
     st.subheader("🖼️ Particle Gallery")
 
-    # Filters
     col1, col2, col3 = st.columns(3)
     with col1:
         filter_class = st.multiselect(
@@ -289,12 +317,19 @@ else:
             key="fc"
         )
     with col2:
+        filter_method = st.multiselect(
+            "Sizing Method:",
+            ["edge_detect", "mask_bounds", "bbox"],
+            default=["edge_detect", "mask_bounds", "bbox"],
+            key="fm"
+        )
+    with col3:
         items_per_page = st.selectbox("Per page:", [12, 18, 24, 36], index=0)
 
     # Filter particles
     all_particles = []
     for idx, p in enumerate(st.session_state.results):
-        if not p.get("deleted") and p["class"] in filter_class:
+        if not p.get("deleted") and p["class"] in filter_class and p["size_method"] in filter_method:
             all_particles.append((idx, p))
 
     if all_particles:
@@ -312,7 +347,7 @@ else:
         cols = st.columns(6)
         for i, (pidx, p) in enumerate(page_particles):
             with cols[i % 6]:
-                # Load tile from uploaded files
+                # Load tile
                 filename = p["tile_filename"]
                 if filename not in st.session_state.tile_files:
                     st.warning("Tile missing")
@@ -323,7 +358,7 @@ else:
                     tile_img = Image.open(file_obj).convert('RGB')
                     tile_img = np.array(tile_img)
                 except Exception as e:
-                    st.warning(f"Load error: {e}")
+                    st.warning(f"Load error")
                     continue
 
                 # Crop
@@ -336,14 +371,19 @@ else:
 
                 crop = tile_img[y1:y2, x1:x2].copy()
 
-                # Draw box
+                # Draw green box
                 crop_pil = Image.fromarray(crop).convert('RGB')
                 draw = ImageDraw.Draw(crop_pil)
                 draw.rectangle([(x-x1, y-y1), (x+w-x1, y+h-y1)], outline=(0, 255, 0), width=2)
                 crop = np.array(crop_pil)
 
+                # Display
                 st.image(crop, use_column_width=True)
-                st.caption(f"{p['class']}\n{p['diameter_um']:.1f}µm")
+
+                # Caption with sizing method
+                method = p["size_method"]
+                method_icon = {"edge_detect": "✨", "mask_bounds": "📊", "bbox": "📦"}
+                st.caption(f"{p['class']} {method_icon.get(method, '?')}\n{p['diameter_um']:.1f}µm\n({method})")
 
                 # Checkbox
                 key = f"sel_{pidx}"
@@ -371,9 +411,66 @@ else:
                     st.session_state.results[pidx]["deleted"] = True
                     st.rerun()
 
+                # View full
+                if st.button("🔍 View Full", key=f"view_{pidx}"):
+                    st.session_state[f"show_full_{pidx}"] = True
+
+        # Full image viewer
+        for pidx, p in [(idx, p) for idx, p in page_particles]:
+            if st.session_state.get(f"show_full_{pidx}", False):
+                filename = p["tile_filename"]
+
+                with st.expander(f"Full Image: {filename}", expanded=True):
+                    if filename not in st.session_state.tile_files:
+                        st.warning("Tile missing")
+                        continue
+
+                    try:
+                        file_obj = st.session_state.tile_files[filename]
+                        tile_img = Image.open(file_obj).convert('RGB')
+                        tile_img = np.array(tile_img)
+                    except:
+                        st.warning("Load error")
+                        continue
+
+                    # Create Plotly figure
+                    fig = go.Figure()
+                    fig.add_trace(go.Image(z=tile_img, name="Image"))
+
+                    # Highlight particle
+                    x, y, w, h = p["x"], p["y"], p["w"], p["h"]
+                    fig.add_shape(
+                        type="rect",
+                        x0=x, y0=y, x1=x + w, y1=y + h,
+                        line=dict(color="lime", width=3)
+                    )
+
+                    fig.update_layout(
+                        title=f"{filename} | {p['class']} ({p['diameter_um']}µm) [{p['size_method']}]",
+                        showlegend=False,
+                        hovermode="closest",
+                        margin=dict(b=0, l=0, r=0, t=40),
+                        height=600,
+                    )
+                    fig.update_xaxes(scaleanchor="y", scaleratio=1)
+                    fig.update_yaxes(scaleanchor="x", scaleratio=1)
+
+                    st.plotly_chart(fig, use_container_width=True)
+
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.write(f"**Class:** {p['class']}")
+                    with col2:
+                        st.write(f"**Size:** {p['diameter_um']}µm ({p['size_bin']})")
+                    with col3:
+                        st.write(f"**Method:** {p['size_method']}")
+
     st.divider()
 
-    # Mass edit
+    # ─────────────────────────────────────────────────────────────────────────
+    # MASS EDIT
+    # ─────────────────────────────────────────────────────────────────────────
+
     if st.session_state.selected_particles:
         st.subheader("⚙️ Bulk Edit")
 
