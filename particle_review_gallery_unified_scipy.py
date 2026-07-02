@@ -374,7 +374,7 @@ else:
                 # Draw green box
                 crop_pil = Image.fromarray(crop).convert('RGB')
                 draw = ImageDraw.Draw(crop_pil)
-                draw.rectangle([(x-x1, y-y1), (x+w-x1, y+h-y1)], outline=(0, 255, 0), width=2)
+                draw.rectangle([(x-x1, y-y1), (x+w-x1, y+h-y1)], outline=(255, 75, 75), width=2)
                 crop = np.array(crop_pil)
 
                 # Display
