@@ -134,6 +134,9 @@ def stitch_merged_particle(tile_files, p):
         return stitched
     except:
         return None
+
+
+def detect_particles_in_tiles(tile_files, tile_metadata, model):
     """Detect in all tiles (loads from uploaded files)"""
     all_particles = []
     progress_bar = st.progress(0)
