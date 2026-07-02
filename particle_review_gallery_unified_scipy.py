@@ -317,12 +317,14 @@ with st.sidebar:
                 )
                 st.write(f"Raw detections: {len(raw_particles)}")
 
-                # Step 2: Deduplicate using TileParticleManager
+                # Step 2: Merge cut particles via positional matching
+                # Your tiles are edge-to-edge (no overlaps), so deduplication
+                # happens by finding matching pieces at seams, not IOU
                 try:
                     from tile_particle_manager import TileParticleManager
                     import tempfile
 
-                    st.write("Deduplicating...")
+                    st.write("Finding & merging cut particles at seams...")
 
                     # Convert metadata to TileParticleManager format
                     mgr_metadata = []
@@ -342,39 +344,55 @@ with st.sidebar:
                         json.dump(mgr_metadata, f)
                         metadata_file = f.name
 
-                    # Deduplicate
+                    # Find & merge cut particles (positional matching)
                     manager = TileParticleManager(metadata_file, iou_threshold=0.3, seam_margin=30)
                     dedup_particles, stats = manager.process_tile_particles(raw_particles)
-
-                    # Attempt to merge cut particles across seams
-                    st.write("Merging cut particles...")
                     merged_particles, merged_pairs = manager.merge_cut_particles(dedup_particles)
 
-                    st.write(f"✅ After dedup: {stats['after_dedup']}")
-                    st.write(f"   Removed: {stats['duplicates_removed']} duplicates (same particle, different tiles)")
-                    st.write(f"   At seams: {stats['at_seams']} (potential cut particles)")
-                    st.write(f"   Merged: {len(merged_pairs)} (stitched together)")
+                    st.write(f"✅ After positional matching: {stats['after_dedup']}")
+                    st.write(f"   Cut particles found: {stats['at_seams']}")
+                    st.write(f"   Merged pieces: {len(merged_pairs)}")
+
+                    with st.expander("📊 What happened:"):
+                        st.write(f"""
+                        **Raw detections:** {len(raw_particles)} (particles detected in all tiles)
+
+                        **Seam particles:** {stats['at_seams']} 
+                        (particles at tile edges, potentially cut)
+
+                        **Merged pairs:** {len(merged_pairs)}
+                        (pieces that were stitched together)
+
+                        **Final count:** {stats['after_dedup']}
+                        (unique particles, counting merged pieces as ONE)
+
+                        **Formula:** Raw - (merged_pairs × 1) = Final
+                        (We remove duplicate half-counts by merging)
+                        """)
 
                     with st.expander("ℹ️ Deduplication Details"):
                         st.write("""
-                        **What happens:**
-                        1. Each tile is detected independently
-                        2. Overlapping detections are compared using IOU (Intersection over Union)
-                        3. If IOU > 0.3, they're considered the same particle → keep only ONE
-                        4. Particles near tile edges are marked as "at_seam"
-                        5. Paired seam particles are stitched together if they match
+                        **Your Tile Setup: Edge-to-Edge (No Overlaps)**
+                        - Tiles are placed side-by-side with no overlapping regions
+                        - Mosaic is 49536×46872 with 2800px tiles
+                        - Example: Tile A (x=0-2800) → Tile B (x=2800-5600)
 
-                        **Size Calculation:**
-                        - Normal particles: scipy edge detection on mask (edge_detect, mask_bounds, or bbox)
-                        - Cut particles (MERGED): 
-                          1. Stitch the two tile images together
-                          2. Re-run scipy edge detection on COMPLETE stitched image
-                          3. Report the FULL diameter (not just half)
-                          4. Method: merged_edge_detect
+                        **Deduplication Method: Positional Matching**
+
+                        Since your tiles don't overlap, deduplication happens via:
+                        1. Particles at tile seams are marked as `at_seam=True`
+                        2. Check neighboring tile for matching particle
+                        3. If particle found at same Y-position and similar size → they're the SAME cut particle
+                        4. MERGE both halves into ONE complete particle
+                        5. Report only the complete particle (not both halves)
+
+                        **Why this matters:**
+                        - Without merging: count particle twice (once per half) ❌ WRONG
+                        - With merging: count particle once (complete) ✅ CORRECT
+                        - IOU deduplication: Not applicable (no overlapping regions)
 
                         **Confidence:**
-                        - Duplicates identified by IOU > 0.3 (30% overlap)
-                        - Only ONE copy kept in final report
+                        - Cut particles identified by: proximity to seam + matching neighbors
                         - Merged particles show COMPLETE size on stitched image
                         """)
 
