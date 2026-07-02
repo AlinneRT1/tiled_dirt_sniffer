@@ -49,20 +49,17 @@ SIZE_BINS = [
     ("J: 1000μm+ (0 pcs)", 1000, float("inf")),
 ]
 
-
 @st.cache_resource
 def load_model():
     if not os.path.exists(MODEL_PATH):
         return None
     return YOLO(MODEL_PATH)
 
-
 def get_size_bin(diameter_um):
     for label, lo, hi in SIZE_BINS:
         if lo <= diameter_um < hi:
             return label
     return "K"
-
 
 def calculate_particle_size_accurate(mask_array, calibration):
     """Edge detection sizing"""
@@ -90,7 +87,6 @@ def calculate_particle_size_accurate(mask_array, calibration):
         pass
 
     return None, "failed"
-
 
 def calculate_merged_particle_size(stitched_image, calibration):
     """Recalculate size on the complete stitched image using edge detection"""
@@ -122,32 +118,31 @@ def calculate_merged_particle_size(stitched_image, calibration):
 
     return None, "failed"
 
-
 def stitch_merged_particle(tile_files, p, calibration=CALIBRATION_UM_PER_PIXEL):
     """Stitch together tiles for a merged cut particle and recalculate size"""
 
     if not p.get("merged"):
-        return None, None
+        return None, None, None
 
     try:
         # Get original particles that were merged
         originals = p.get("original_particles", [])
         if len(originals) < 2:
-            return None, None
+            return None, None, None
 
         # Load both tile images
         images = []
         for orig in originals:
             filename = orig["tile_filename"]
             if filename not in tile_files:
-                return None, None
+                return None, None, None
 
             file_obj = tile_files[filename]
             tile_img = Image.open(file_obj).convert('RGB')
             images.append(np.array(tile_img))
 
         if len(images) < 2:
-            return None, None
+            return None, None, None
 
         # Get positions of original particles
         img1, img2 = images[0], images[1]
@@ -155,12 +150,15 @@ def stitch_merged_particle(tile_files, p, calibration=CALIBRATION_UM_PER_PIXEL):
 
         # Simple stitch: side by side or top to bottom
         # Check which direction to stitch based on position
+        seam_position = None
         if p1["tile_filename"] < p2["tile_filename"]:  # Rough ordering
             # Horizontal stitch (left-right)
             stitched = np.concatenate([img1, img2], axis=1)
+            seam_position = {"type": "vertical", "pos": img1.shape[1]}  # Seam at x=width of img1
         else:
             # Vertical stitch (top-bottom)
             stitched = np.concatenate([img1, img2], axis=0)
+            seam_position = {"type": "horizontal", "pos": img1.shape[0]}  # Seam at y=height of img1
 
         # RECALCULATE SIZE on complete stitched image
         merged_diameter_um, merged_method = calculate_merged_particle_size(stitched, calibration)
@@ -169,10 +167,9 @@ def stitch_merged_particle(tile_files, p, calibration=CALIBRATION_UM_PER_PIXEL):
             "diameter_um": merged_diameter_um,
             "size_method": merged_method,
             "size_bin": get_size_bin(merged_diameter_um) if merged_diameter_um else "?"
-        }
+        }, seam_position
     except:
-        return None, None
-
+        return None, None, None
 
 def detect_particles_in_tiles(tile_files, tile_metadata, model):
     """Detect in all tiles (loads from uploaded files)"""
@@ -248,7 +245,6 @@ def detect_particles_in_tiles(tile_files, tile_metadata, model):
     status.empty()
     return all_particles
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # SESSION STATE
 # ─────────────────────────────────────────────────────────────────────────────
@@ -264,10 +260,8 @@ if "tile_metadata" not in st.session_state:
 if "tile_files" not in st.session_state:
     st.session_state.tile_files = {}
 
-
 def push_undo():
     st.session_state.undo_stack.append(deepcopy(st.session_state.results))
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SIDEBAR
@@ -356,16 +350,16 @@ with st.sidebar:
                     with st.expander("📊 What happened:"):
                         st.write(f"""
                         **Raw detections:** {len(raw_particles)} (particles detected in all tiles)
-
+                        
                         **Seam particles:** {stats['at_seams']} 
                         (particles at tile edges, potentially cut)
-
+                        
                         **Merged pairs:** {len(merged_pairs)}
                         (pieces that were stitched together)
-
+                        
                         **Final count:** {stats['after_dedup']}
                         (unique particles, counting merged pieces as ONE)
-
+                        
                         **Formula:** Raw - (merged_pairs × 1) = Final
                         (We remove duplicate half-counts by merging)
                         """)
@@ -376,21 +370,21 @@ with st.sidebar:
                         - Tiles are placed side-by-side with no overlapping regions
                         - Mosaic is 49536×46872 with 2800px tiles
                         - Example: Tile A (x=0-2800) → Tile B (x=2800-5600)
-
+                        
                         **Deduplication Method: Positional Matching**
-
+                        
                         Since your tiles don't overlap, deduplication happens via:
                         1. Particles at tile seams are marked as `at_seam=True`
                         2. Check neighboring tile for matching particle
                         3. If particle found at same Y-position and similar size → they're the SAME cut particle
                         4. MERGE both halves into ONE complete particle
                         5. Report only the complete particle (not both halves)
-
+                        
                         **Why this matters:**
                         - Without merging: count particle twice (once per half) ❌ WRONG
                         - With merging: count particle once (complete) ✅ CORRECT
                         - IOU deduplication: Not applicable (no overlapping regions)
-
+                        
                         **Confidence:**
                         - Cut particles identified by: proximity to seam + matching neighbors
                         - Merged particles show COMPLETE size on stitched image
@@ -430,8 +424,7 @@ with st.sidebar:
             rows = []
             for p in st.session_state.results:
                 if not p.get("deleted"):
-                    status = "MERGED (stitched)" if p.get("merged") else (
-                        "AT_SEAM (check)" if p.get("at_seam") else "OK")
+                    status = "MERGED (stitched)" if p.get("merged") else ("AT_SEAM (check)" if p.get("at_seam") else "OK")
 
                     # If merged, try to get recalculated size
                     diameter_um = p["diameter_um"]
@@ -439,8 +432,8 @@ with st.sidebar:
                     size_bin = p["size_bin"]
 
                     if p.get("merged"):
-                        stitched, merged_meta = stitch_merged_particle(st.session_state.tile_files, p)
-                        if merged_meta and merged_meta["diameter_um"]:
+                        stitched, merged_meta, seam_info = stitch_merged_particle(st.session_state.tile_files, p)
+                        if merged_meta and merged_meta.get("diameter_um"):
                             diameter_um = merged_meta["diameter_um"]
                             size_method = merged_meta["size_method"]
                             size_bin = merged_meta["size_bin"]
@@ -483,7 +476,7 @@ else:
         data[cls] = {}
         for b, _, _ in SIZE_BINS:
             count = len([p for p in st.session_state.results
-                         if p["class"] == cls and p["size_bin"] == b and not p.get("deleted")])
+                        if p["class"] == cls and p["size_bin"] == b and not p.get("deleted")])
             data[cls][b] = count
 
     rows = []
@@ -590,7 +583,7 @@ else:
                     # Draw bright blue box
                     crop_pil = Image.fromarray(crop).convert('RGB')
                     draw = ImageDraw.Draw(crop_pil)
-                    draw.rectangle([(x - x1, y - y1), (x + w - x1, y + h - y1)], outline=(0, 100, 255), width=2)
+                    draw.rectangle([(x-x1, y-y1), (x+w-x1, y+h-y1)], outline=(0, 100, 255), width=2)
                     crop = np.array(crop_pil)
 
                     # Display
@@ -658,18 +651,79 @@ else:
                             st.info("✅ Cut particle detected and merged")
 
                             try:
-                                stitched, merged_metadata = stitch_merged_particle(st.session_state.tile_files, p)
+                                stitched, merged_metadata, seam_info = stitch_merged_particle(st.session_state.tile_files, p)
 
                                 if stitched is not None:
-                                    st.image(stitched, use_column_width=True, caption="Stitched from multiple tiles")
+                                    # Create Plotly figure for stitched image with annotations
+                                    fig = go.Figure()
+                                    fig.add_trace(go.Image(z=stitched, name="Stitched"))
+
+                                    # Draw RED SEAM LINE
+                                    if seam_info:
+                                        if seam_info["type"] == "vertical":
+                                            # Vertical seam (left-right stitch)
+                                            seam_x = seam_info["pos"]
+                                            fig.add_shape(
+                                                type="line",
+                                                x0=seam_x, y0=0,
+                                                x1=seam_x, y1=stitched.shape[0],
+                                                line=dict(color="red", width=3, dash="dash")
+                                            )
+                                            fig.add_annotation(
+                                                x=seam_x, y=10,
+                                                text="SEAM",
+                                                showarrow=False,
+                                                font=dict(color="red", size=12),
+                                                bgcolor="white"
+                                            )
+                                        else:
+                                            # Horizontal seam (top-bottom stitch)
+                                            seam_y = seam_info["pos"]
+                                            fig.add_shape(
+                                                type="line",
+                                                x0=0, y0=seam_y,
+                                                x1=stitched.shape[1], y1=seam_y,
+                                                line=dict(color="red", width=3, dash="dash")
+                                            )
+                                            fig.add_annotation(
+                                                x=10, y=seam_y,
+                                                text="SEAM",
+                                                showarrow=False,
+                                                font=dict(color="red", size=12),
+                                                bgcolor="white"
+                                            )
+
+                                    # Draw BLUE BOX around merged particle
+                                    x = p.get("x")
+                                    y = p.get("y")
+                                    w = p.get("w")
+                                    h = p.get("h")
+
+                                    if x is not None and y is not None and w is not None and h is not None:
+                                        fig.add_shape(
+                                            type="rect",
+                                            x0=x, y0=y, x1=x + w, y1=y + h,
+                                            line=dict(color="rgb(0, 100, 255)", width=4)
+                                        )
+
+                                    fig.update_layout(
+                                        title=f"Merged Particle (Stitched) | {p.get('class', '?')} | {merged_metadata.get('diameter_um', '?') if merged_metadata else '?'}µm",
+                                        showlegend=False,
+                                        hovermode="closest",
+                                        margin=dict(b=0, l=0, r=0, t=40),
+                                        height=600,
+                                    )
+                                    fig.update_xaxes(scaleanchor="y", scaleratio=1)
+                                    fig.update_yaxes(scaleanchor="x", scaleratio=1)
+
+                                    st.plotly_chart(fig, use_container_width=True)
 
                                     if merged_metadata:
                                         c1, c2, c3, c4 = st.columns(4)
                                         with c1:
                                             st.write(f"**Class:** {p.get('class', '?')}")
                                         with c2:
-                                            st.write(
-                                                f"**Size:** {merged_metadata.get('diameter_um', '?')}µm ({merged_metadata.get('size_bin', '?')})")
+                                            st.write(f"**Size (recalc):** {merged_metadata.get('diameter_um', '?')}µm ({merged_metadata.get('size_bin', '?')})")
                                         with c3:
                                             st.write(f"**Method:** {merged_metadata.get('size_method', '?')}")
                                         with c4:
@@ -697,8 +751,8 @@ else:
                                 h = p.get("h", 0)
 
                                 if x and y and w and h:
-                                    fig.add_shape(type="rect", x0=x, y0=y, x1=x + w, y1=y + h,
-                                                  line=dict(color="rgb(0, 100, 255)", width=3))
+                                    fig.add_shape(type="rect", x0=x, y0=y, x1=x+w, y1=y+h,
+                                               line=dict(color="rgb(0, 100, 255)", width=3))
 
                                 fig.update_layout(
                                     title=f"{filename} | {p.get('class', '?')} ({p.get('size_bin', '?')}) {p.get('diameter_um', '?')}µm",
