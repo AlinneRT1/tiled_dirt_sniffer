@@ -48,20 +48,17 @@ SIZE_BINS = [
     ("J: 1000μm+", 1000, float("inf")),
 ]
 
-
 @st.cache_resource
 def load_model():
     if not os.path.exists(MODEL_PATH):
         return None
     return YOLO(MODEL_PATH)
 
-
 def get_size_bin(diameter_um):
     for label, lo, hi in SIZE_BINS:
         if lo <= diameter_um < hi:
             return label
     return "K"
-
 
 def calculate_particle_size_accurate(mask_array, calibration):
     """Edge detection sizing"""
@@ -89,7 +86,6 @@ def calculate_particle_size_accurate(mask_array, calibration):
         pass
 
     return None, "failed"
-
 
 def detect_particles_in_tiles(tile_files, tile_metadata, model):
     """Detect in all tiles (loads from uploaded files)"""
@@ -165,7 +161,6 @@ def detect_particles_in_tiles(tile_files, tile_metadata, model):
     status.empty()
     return all_particles
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # SESSION STATE
 # ─────────────────────────────────────────────────────────────────────────────
@@ -181,10 +176,8 @@ if "tile_metadata" not in st.session_state:
 if "tile_files" not in st.session_state:
     st.session_state.tile_files = {}
 
-
 def push_undo():
     st.session_state.undo_stack.append(deepcopy(st.session_state.results))
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SIDEBAR
@@ -291,7 +284,7 @@ else:
         data[cls] = {}
         for b, _, _ in SIZE_BINS:
             count = len([p for p in st.session_state.results
-                         if p["class"] == cls and p["size_bin"] == b and not p.get("deleted")])
+                        if p["class"] == cls and p["size_bin"] == b and not p.get("deleted")])
             data[cls][b] = count
 
     rows = []
@@ -344,7 +337,10 @@ else:
 
         # Pagination
         total_pages = max(1, (len(all_particles) + items_per_page - 1) // items_per_page)
-        page = st.slider("Page:", 1, total_pages, 1) - 1
+        if total_pages > 1:
+            page = st.slider("Page:", 1, total_pages, 1) - 1
+        else:
+            page = 0
 
         start = page * items_per_page
         end = start + items_per_page
@@ -381,7 +377,7 @@ else:
                 # Draw green box
                 crop_pil = Image.fromarray(crop).convert('RGB')
                 draw = ImageDraw.Draw(crop_pil)
-                draw.rectangle([(x - x1, y - y1), (x + w - x1, y + h - y1)], outline=(255, 75, 75), width=2)
+                draw.rectangle([(x-x1, y-y1), (x+w-x1, y+h-y1)], outline=(75, 145, 255), width=2)
                 crop = np.array(crop_pil)
 
                 # Display
