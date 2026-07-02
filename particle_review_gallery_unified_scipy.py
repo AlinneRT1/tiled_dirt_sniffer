@@ -20,8 +20,6 @@ from PIL import Image, ImageDraw
 import pandas as pd
 import json
 import os
-import zipfile
-import tempfile
 from datetime import datetime
 from ultralytics import YOLO
 from copy import deepcopy
@@ -86,28 +84,30 @@ def calculate_particle_size_accurate(mask_array, calibration):
 
     return None, "failed"
 
-def load_tile_image(tile_dir, tile_filename):
-    """Load tile on-demand (lazy loading)"""
-    tile_path = os.path.join(tile_dir, tile_filename)
-    if os.path.exists(tile_path):
-        img_pil = Image.open(tile_path)
-        if img_pil.mode != 'RGB':
-            img_pil = img_pil.convert('RGB')
-        return np.array(img_pil)
-    return None
-
-def detect_particles_in_tiles(tile_dir, tile_metadata, model):
-    """Detect in all tiles (loads one at a time)"""
+def detect_particles_in_tiles(tile_files, tile_metadata, model):
+    """Detect in all tiles (loads from uploaded files)"""
     all_particles = []
     progress_bar = st.progress(0)
     status = st.empty()
 
     for idx, tile_meta in enumerate(tile_metadata):
-        status.text(f"Detecting {idx + 1}/{len(tile_metadata)}: {tile_meta['filename']}")
+        filename = tile_meta['filename']
+        status.text(f"Detecting {idx + 1}/{len(tile_metadata)}: {filename}")
 
-        tile_img = load_tile_image(tile_dir, tile_meta['filename'])
-        if tile_img is None:
-            st.warning(f"Failed to load {tile_meta['filename']}")
+        # Load from uploaded file
+        if filename not in tile_files:
+            st.warning(f"Missing: {filename}")
+            progress_bar.progress((idx + 1) / len(tile_metadata))
+            continue
+
+        try:
+            file_obj = tile_files[filename]
+            img_pil = Image.open(file_obj)
+            if img_pil.mode != 'RGB':
+                img_pil = img_pil.convert('RGB')
+            tile_img = np.array(img_pil)
+        except Exception as e:
+            st.warning(f"Failed to load {filename}: {e}")
             progress_bar.progress((idx + 1) / len(tile_metadata))
             continue
 
@@ -118,7 +118,7 @@ def detect_particles_in_tiles(tile_dir, tile_metadata, model):
         try:
             results = model(tile_img_bgr, iou=0.45, conf=0.02, verbose=False)
         except Exception as e:
-            st.warning(f"Detection failed on {tile_meta['filename']}: {e}")
+            st.warning(f"Detection failed on {filename}: {e}")
             progress_bar.progress((idx + 1) / len(tile_metadata))
             continue
 
@@ -143,7 +143,7 @@ def detect_particles_in_tiles(tile_dir, tile_metadata, model):
 
                 all_particles.append({
                     "tile_id": idx,
-                    "tile_filename": tile_meta['filename'],
+                    "tile_filename": filename,
                     "x": x1, "y": y1, "w": x2 - x1, "h": y2 - y1,
                     "class": model.names[int(cls)],
                     "confidence": float(conf),
@@ -170,8 +170,8 @@ if "selected_particles" not in st.session_state:
     st.session_state.selected_particles = set()
 if "tile_metadata" not in st.session_state:
     st.session_state.tile_metadata = None
-if "tile_dir_path" not in st.session_state:
-    st.session_state.tile_dir_path = None
+if "tile_files" not in st.session_state:
+    st.session_state.tile_files = {}
 
 def push_undo():
     st.session_state.undo_stack.append(deepcopy(st.session_state.results))
@@ -183,39 +183,37 @@ def push_undo():
 with st.sidebar:
     st.header("📤 Upload Tiles")
 
-    zip_file = st.file_uploader("Upload tiles.zip", type=["zip"])
+    st.write("**Step 1: Upload manifest.json**")
+    manifest_file = st.file_uploader("Manifest:", type=["json"], key="manifest")
 
-    if zip_file and st.button("📋 Extract & Load"):
+    st.write("**Step 2: Upload tile images**")
+    tile_files = st.file_uploader(
+        "Tile images:",
+        type=["jpg", "jpeg", "png", "tif"],
+        accept_multiple_files=True,
+        key="tiles"
+    )
+
+    if manifest_file and tile_files and st.button("📋 Load"):
         try:
-            # Extract to persistent temp dir
-            tmpdir = tempfile.mkdtemp()
-            st.session_state.tmpdir = tmpdir
+            # Load manifest
+            manifest = json.load(manifest_file)
+            tile_metadata = manifest.get("tiles", [])
 
-            with zipfile.ZipFile(zip_file) as z:
-                z.extractall(tmpdir)
+            st.write(f"✅ Manifest: {len(tile_metadata)} tiles")
+            st.write(f"✅ Uploaded: {len(tile_files)} files")
 
-            st.write("✅ Extracted")
+            # Create mapping of filename -> file object
+            file_map = {f.name: f for f in tile_files}
 
-            # Find manifest
-            manifest_path = None
-            for root, dirs, files in os.walk(tmpdir):
-                if "manifest.json" in files:
-                    manifest_path = os.path.join(root, "manifest.json")
-                    break
+            st.session_state.tile_metadata = tile_metadata
+            st.session_state.tile_files = file_map
 
-            if manifest_path:
-                with open(manifest_path) as f:
-                    manifest = json.load(f)
-
-                tile_metadata = manifest.get("tiles", [])
-                st.session_state.tile_metadata = tile_metadata
-                st.session_state.tile_dir_path = os.path.dirname(manifest_path)
-
-                st.success(f"✅ Loaded {len(tile_metadata)} tiles")
-            else:
-                st.error("manifest.json not found")
+            st.success(f"✅ Ready to detect!")
         except Exception as e:
             st.error(f"Error: {e}")
+            import traceback
+            st.write(traceback.format_exc())
 
     st.divider()
 
@@ -226,7 +224,7 @@ with st.sidebar:
                 st.error("Model not found")
             else:
                 particles = detect_particles_in_tiles(
-                    st.session_state.tile_dir_path,
+                    st.session_state.tile_files,
                     st.session_state.tile_metadata,
                     model
                 )
@@ -314,10 +312,18 @@ else:
         cols = st.columns(6)
         for i, (pidx, p) in enumerate(page_particles):
             with cols[i % 6]:
-                # Load tile on-demand
-                tile_img = load_tile_image(st.session_state.tile_dir_path, p["tile_filename"])
-                if tile_img is None:
-                    st.warning("Tile load failed")
+                # Load tile from uploaded files
+                filename = p["tile_filename"]
+                if filename not in st.session_state.tile_files:
+                    st.warning("Tile missing")
+                    continue
+
+                try:
+                    file_obj = st.session_state.tile_files[filename]
+                    tile_img = Image.open(file_obj).convert('RGB')
+                    tile_img = np.array(tile_img)
+                except Exception as e:
+                    st.warning(f"Load error: {e}")
                     continue
 
                 # Crop
