@@ -92,31 +92,62 @@ def calculate_particle_size_accurate(mask_array, calibration):
     return None, "failed"
 
 
-def stitch_merged_particle(tile_files, p):
-    """Stitch together tiles for a merged cut particle"""
+def calculate_merged_particle_size(stitched_image, calibration):
+    """Recalculate size on the complete stitched image using edge detection"""
+
+    try:
+        if stitched_image is None or stitched_image.size == 0:
+            return None, "failed"
+
+        # Convert to grayscale for edge detection
+        if len(stitched_image.shape) == 3:
+            gray = cv2.cvtColor(stitched_image, cv2.COLOR_RGB2GRAY)
+        else:
+            gray = stitched_image
+
+        # Apply edge detection
+        edges = ndimage.sobel(gray.astype(float))
+        edge_pixels = np.where(edges > 0.1)
+
+        if len(edge_pixels[0]) > 0:
+            y_min, y_max = edge_pixels[0].min(), edge_pixels[0].max()
+            x_min, x_max = edge_pixels[1].min(), edge_pixels[1].max()
+
+            # True diameter from COMPLETE stitched particle
+            diameter_pixels = max(x_max - x_min + 1, y_max - y_min + 1)
+            diameter_um = diameter_pixels * calibration
+            return round(diameter_um, 1), "merged_edge_detect"
+    except:
+        pass
+
+    return None, "failed"
+
+
+def stitch_merged_particle(tile_files, p, calibration=CALIBRATION_UM_PER_PIXEL):
+    """Stitch together tiles for a merged cut particle and recalculate size"""
 
     if not p.get("merged"):
-        return None
+        return None, None
 
     try:
         # Get original particles that were merged
         originals = p.get("original_particles", [])
         if len(originals) < 2:
-            return None
+            return None, None
 
         # Load both tile images
         images = []
         for orig in originals:
             filename = orig["tile_filename"]
             if filename not in tile_files:
-                return None
+                return None, None
 
             file_obj = tile_files[filename]
             tile_img = Image.open(file_obj).convert('RGB')
             images.append(np.array(tile_img))
 
         if len(images) < 2:
-            return None
+            return None, None
 
         # Get positions of original particles
         img1, img2 = images[0], images[1]
@@ -131,9 +162,16 @@ def stitch_merged_particle(tile_files, p):
             # Vertical stitch (top-bottom)
             stitched = np.concatenate([img1, img2], axis=0)
 
-        return stitched
+        # RECALCULATE SIZE on complete stitched image
+        merged_diameter_um, merged_method = calculate_merged_particle_size(stitched, calibration)
+
+        return stitched, {
+            "diameter_um": merged_diameter_um,
+            "size_method": merged_method,
+            "size_bin": get_size_bin(merged_diameter_um) if merged_diameter_um else "?"
+        }
     except:
-        return None
+        return None, None
 
 
 def detect_particles_in_tiles(tile_files, tile_metadata, model):
@@ -326,10 +364,18 @@ with st.sidebar:
                         4. Particles near tile edges are marked as "at_seam"
                         5. Paired seam particles are stitched together if they match
 
+                        **Size Calculation:**
+                        - Normal particles: scipy edge detection on mask (edge_detect, mask_bounds, or bbox)
+                        - Cut particles (MERGED): 
+                          1. Stitch the two tile images together
+                          2. Re-run scipy edge detection on COMPLETE stitched image
+                          3. Report the FULL diameter (not just half)
+                          4. Method: merged_edge_detect
+
                         **Confidence:**
                         - Duplicates identified by IOU > 0.3 (30% overlap)
                         - Only ONE copy kept in final report
-                        - Merged particles show both original positions
+                        - Merged particles show COMPLETE size on stitched image
                         """)
 
                     st.session_state.results = merged_particles
@@ -368,12 +414,26 @@ with st.sidebar:
                 if not p.get("deleted"):
                     status = "MERGED (stitched)" if p.get("merged") else (
                         "AT_SEAM (check)" if p.get("at_seam") else "OK")
+
+                    # If merged, try to get recalculated size
+                    diameter_um = p["diameter_um"]
+                    size_method = p["size_method"]
+                    size_bin = p["size_bin"]
+
+                    if p.get("merged"):
+                        stitched, merged_meta = stitch_merged_particle(st.session_state.tile_files, p)
+                        if merged_meta and merged_meta["diameter_um"]:
+                            diameter_um = merged_meta["diameter_um"]
+                            size_method = merged_meta["size_method"]
+                            size_bin = merged_meta["size_bin"]
+                            status = f"MERGED_RECALC ({size_method})"
+
                     rows.append({
                         "tile": p["tile_filename"],
                         "class": p["class"],
-                        "diameter_um": p["diameter_um"],
-                        "size_bin": p["size_bin"],
-                        "size_method": p["size_method"],
+                        "diameter_um": diameter_um,
+                        "size_bin": size_bin,
+                        "size_method": size_method,
                         "confidence": round(p["confidence"], 3),
                         "status": status,
                     })
@@ -484,154 +544,165 @@ else:
         cols = st.columns(6)
         for i, (pidx, p) in enumerate(page_particles):
             with cols[i % 6]:
-                # Load tile
-                filename = p["tile_filename"]
-                if filename not in st.session_state.tile_files:
-                    st.warning("Tile missing")
-                    continue
-
                 try:
-                    file_obj = st.session_state.tile_files[filename]
-                    tile_img = Image.open(file_obj).convert('RGB')
-                    tile_img = np.array(tile_img)
+                    # Load tile
+                    filename = p.get("tile_filename")
+                    if not filename or filename not in st.session_state.tile_files:
+                        st.warning("❌ Tile missing")
+                        continue
+
+                    try:
+                        file_obj = st.session_state.tile_files[filename]
+                        tile_img = Image.open(file_obj).convert('RGB')
+                        tile_img = np.array(tile_img)
+                    except Exception as e:
+                        st.error(f"❌ Tile error")
+                        continue
+
+                    # Crop
+                    x, y, w, h = p.get("x", 0), p.get("y", 0), p.get("w", 10), p.get("h", 10)
+                    margin = 15
+                    x1 = max(0, x - margin)
+                    y1 = max(0, y - margin)
+                    x2 = min(tile_img.shape[1], x + w + margin)
+                    y2 = min(tile_img.shape[0], y + h + margin)
+
+                    crop = tile_img[y1:y2, x1:x2].copy()
+
+                    # Draw bright blue box
+                    crop_pil = Image.fromarray(crop).convert('RGB')
+                    draw = ImageDraw.Draw(crop_pil)
+                    draw.rectangle([(x - x1, y - y1), (x + w - x1, y + h - y1)], outline=(0, 100, 255), width=2)
+                    crop = np.array(crop_pil)
+
+                    # Display
+                    st.image(crop, use_column_width=True)
+
+                    # Caption with size bin and sizing method
+                    method = p.get("size_method", "?")
+                    caption = f"{p.get('class', '?')} | {p.get('size_bin', '?')}\n{p.get('diameter_um', '?'):.1f}µm\n({method})"
+
+                    # Mark merged particles
+                    if p.get("merged"):
+                        caption = f"🔗 MERGED\n{caption}\n✅ Size recalculated"
+
+                    # Add seam warning if applicable
+                    if p.get("at_seam") and not p.get("merged"):
+                        caption += f"\n⚠️ At seams"
+
+                    st.caption(caption)
+
+                    # Checkbox
+                    key = f"sel_{pidx}"
+                    is_selected = key in st.session_state.selected_particles
+                    if st.checkbox("Select", value=is_selected, key=key):
+                        st.session_state.selected_particles.add(key)
+                    else:
+                        st.session_state.selected_particles.discard(key)
+
+                    # Edit class
+                    new_cls = st.selectbox(
+                        "Class:",
+                        ["Fiber", "Glass", "Metallic", "Other"],
+                        index=["Fiber", "Glass", "Metallic", "Other"].index(p.get("class", "Other")),
+                        key=f"cls_{pidx}"
+                    )
+                    if new_cls != p.get("class") and st.button("✓", key=f"save_{pidx}"):
+                        push_undo()
+                        st.session_state.results[pidx]["class"] = new_cls
+                        st.rerun()
+
+                    # Delete
+                    if st.button("🗑️", key=f"del_{pidx}"):
+                        push_undo()
+                        st.session_state.results[pidx]["deleted"] = True
+                        st.rerun()
+
+                    # View full
+                    if st.button("🔍 View Full", key=f"view_{pidx}"):
+                        st.session_state[f"show_full_{pidx}"] = True
+
                 except Exception as e:
-                    st.warning(f"Load error")
-                    continue
-
-                # Crop
-                x, y, w, h = p["x"], p["y"], p["w"], p["h"]
-                margin = 15
-                x1 = max(0, x - margin)
-                y1 = max(0, y - margin)
-                x2 = min(tile_img.shape[1], x + w + margin)
-                y2 = min(tile_img.shape[0], y + h + margin)
-
-                crop = tile_img[y1:y2, x1:x2].copy()
-
-                # Draw bright blue box
-                crop_pil = Image.fromarray(crop).convert('RGB')
-                draw = ImageDraw.Draw(crop_pil)
-                draw.rectangle([(x - x1, y - y1), (x + w - x1, y + h - y1)], outline=(0, 100, 255), width=2)
-                crop = np.array(crop_pil)
-
-                # Display
-                st.image(crop, use_column_width=True)
-
-                # Caption with size bin and sizing method
-                method = p["size_method"]
-
-                caption = f"{p['class']} | {p['size_bin']}\n{p['diameter_um']:.1f}µm\n({method})"
-
-                # Mark merged particles
-                if p.get("merged"):
-                    caption = f"🔗 MERGED\n{caption}\n✅ Cut particle stitched"
-
-                # Add seam warning if applicable
-                if p.get("at_seam") and not p.get("merged"):
-                    caption += f"\n⚠️ At seams: {p.get('seams', [])}"
-
-                st.caption(caption)
-
-                # Checkbox
-                key = f"sel_{pidx}"
-                is_selected = key in st.session_state.selected_particles
-                if st.checkbox("Select", value=is_selected, key=key):
-                    st.session_state.selected_particles.add(key)
-                else:
-                    st.session_state.selected_particles.discard(key)
-
-                # Edit class
-                new_cls = st.selectbox(
-                    "Class:",
-                    ["Fiber", "Glass", "Metallic", "Other"],
-                    index=["Fiber", "Glass", "Metallic", "Other"].index(p["class"]),
-                    key=f"cls_{pidx}"
-                )
-                if new_cls != p["class"] and st.button("✓", key=f"save_{pidx}"):
-                    push_undo()
-                    st.session_state.results[pidx]["class"] = new_cls
-                    st.rerun()
-
-                # Delete
-                if st.button("🗑️", key=f"del_{pidx}"):
-                    push_undo()
-                    st.session_state.results[pidx]["deleted"] = True
-                    st.rerun()
-
-                # View full
-                if st.button("🔍 View Full", key=f"view_{pidx}"):
-                    st.session_state[f"show_full_{pidx}"] = True
+                    st.error(f"❌ Display error")
 
         # Full image viewer
         for pidx, p in [(idx, p) for idx, p in page_particles]:
             if st.session_state.get(f"show_full_{pidx}", False):
-                filename = p["tile_filename"]
+                try:
+                    filename = p.get("tile_filename")
+                    if not filename:
+                        st.error("❌ Tile filename missing")
+                        continue
 
-                # Check if merged - show stitched image
-                if p.get("merged"):
-                    with st.expander(f"🔗 MERGED PARTICLE: {filename}", expanded=True):
-                        st.info("✅ This particle was detected as cut across tile seams and merged together")
+                    # Check if merged - show stitched image
+                    if p.get("merged"):
+                        with st.expander(f"🔗 MERGED PARTICLE: {filename}", expanded=True):
+                            st.info("✅ Cut particle detected and merged")
 
-                        # Try to stitch
-                        stitched = stitch_merged_particle(st.session_state.tile_files, p)
+                            try:
+                                stitched, merged_metadata = stitch_merged_particle(st.session_state.tile_files, p)
 
-                        if stitched is not None:
-                            st.image(stitched, use_column_width=True, caption="Stitched together from multiple tiles")
+                                if stitched is not None:
+                                    st.image(stitched, use_column_width=True, caption="Stitched from multiple tiles")
 
-                        col1, col2, col3, col4 = st.columns(4)
-                        with col1:
-                            st.write(f"**Class:** {p['class']}")
-                        with col2:
-                            st.write(f"**Size:** {p['diameter_um']}µm ({p['size_bin']})")
-                        with col3:
-                            st.write(f"**Method:** {p['size_method']}")
-                        with col4:
-                            st.write(f"**Tiles:** {len(p.get('original_particles', []))}")
+                                    if merged_metadata:
+                                        c1, c2, c3, c4 = st.columns(4)
+                                        with c1:
+                                            st.write(f"**Class:** {p.get('class', '?')}")
+                                        with c2:
+                                            st.write(
+                                                f"**Size:** {merged_metadata.get('diameter_um', '?')}µm ({merged_metadata.get('size_bin', '?')})")
+                                        with c3:
+                                            st.write(f"**Method:** {merged_metadata.get('size_method', '?')}")
+                                        with c4:
+                                            st.write(f"**Tiles:** {len(p.get('original_particles', []))}")
+                            except Exception as e:
+                                st.error(f"❌ Stitch error: {str(e)[:60]}")
 
-                # Normal single-tile view
-                elif filename not in st.session_state.tile_files:
-                    st.warning("Tile missing")
-                else:
-                    with st.expander(f"Full Image: {filename}", expanded=True):
-                        try:
-                            file_obj = st.session_state.tile_files[filename]
-                            tile_img = Image.open(file_obj).convert('RGB')
-                            tile_img = np.array(tile_img)
-                        except:
-                            st.warning("Load error")
-                            continue
+                    # Normal single-tile view
+                    elif filename not in st.session_state.tile_files:
+                        st.warning(f"❌ Tile not in upload: {filename}")
+                    else:
+                        with st.expander(f"Full Image: {filename}", expanded=True):
+                            try:
+                                file_obj = st.session_state.tile_files[filename]
+                                tile_img = Image.open(file_obj).convert('RGB')
+                                tile_img = np.array(tile_img)
 
-                        # Create Plotly figure
-                        fig = go.Figure()
-                        fig.add_trace(go.Image(z=tile_img, name="Image"))
+                                fig = go.Figure()
+                                fig.add_trace(go.Image(z=tile_img, name="Image"))
 
-                        # Highlight particle with bright blue box
-                        x, y, w, h = p["x"], p["y"], p["w"], p["h"]
-                        fig.add_shape(
-                            type="rect",
-                            x0=x, y0=y, x1=x + w, y1=y + h,
-                            line=dict(color="rgb(0, 100, 255)", width=3)
-                        )
+                                # Get box coordinates safely
+                                x = p.get("x", 0)
+                                y = p.get("y", 0)
+                                w = p.get("w", 0)
+                                h = p.get("h", 0)
 
-                        fig.update_layout(
-                            title=f"{filename} | {p['class']} ({p['size_bin']}) {p['diameter_um']}µm [{p['size_method']}]",
-                            showlegend=False,
-                            hovermode="closest",
-                            margin=dict(b=0, l=0, r=0, t=40),
-                            height=600,
-                        )
-                        fig.update_xaxes(scaleanchor="y", scaleratio=1)
-                        fig.update_yaxes(scaleanchor="x", scaleratio=1)
+                                if x and y and w and h:
+                                    fig.add_shape(type="rect", x0=x, y0=y, x1=x + w, y1=y + h,
+                                                  line=dict(color="rgb(0, 100, 255)", width=3))
 
-                        st.plotly_chart(fig, use_container_width=True)
+                                fig.update_layout(
+                                    title=f"{filename} | {p.get('class', '?')} ({p.get('size_bin', '?')}) {p.get('diameter_um', '?')}µm",
+                                    showlegend=False, hovermode="closest",
+                                    margin=dict(b=0, l=0, r=0, t=40), height=600)
+                                fig.update_xaxes(scaleanchor="y", scaleratio=1)
+                                fig.update_yaxes(scaleanchor="x", scaleratio=1)
 
-                        col1, col2, col3 = st.columns(3)
-                        with col1:
-                            st.write(f"**Class:** {p['class']}")
-                        with col2:
-                            st.write(f"**Size:** {p['diameter_um']}µm ({p['size_bin']})")
-                        with col3:
-                            st.write(f"**Method:** {p['size_method']}")
+                                st.plotly_chart(fig, use_container_width=True)
+
+                                c1, c2, c3 = st.columns(3)
+                                with c1:
+                                    st.write(f"**Class:** {p.get('class', '?')}")
+                                with c2:
+                                    st.write(f"**Size:** {p.get('diameter_um', '?')}µm ({p.get('size_bin', '?')})")
+                                with c3:
+                                    st.write(f"**Method:** {p.get('size_method', '?')}")
+                            except Exception as e:
+                                st.error(f"❌ Load error: {str(e)[:60]}")
+
+                except Exception as e:
+                    st.error(f"❌ Unexpected error: {str(e)[:60]}")
 
     st.divider()
 
