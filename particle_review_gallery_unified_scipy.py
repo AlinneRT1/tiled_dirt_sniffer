@@ -23,6 +23,7 @@ from PIL import Image, ImageDraw
 import pandas as pd
 import json
 import os
+import tempfile
 from datetime import datetime
 from ultralytics import YOLO
 from copy import deepcopy
@@ -219,15 +220,60 @@ with st.sidebar:
             if model is None:
                 st.error("Model not found")
             else:
-                particles = detect_particles_in_tiles(
+                # Step 1: Detect in all tiles
+                raw_particles = detect_particles_in_tiles(
                     st.session_state.tile_files,
                     st.session_state.tile_metadata,
                     model
                 )
-                st.session_state.results = particles
+                st.write(f"Raw detections: {len(raw_particles)}")
+
+                # Step 2: Deduplicate using TileParticleManager
+                try:
+                    from tile_particle_manager import TileParticleManager
+                    import tempfile
+
+                    st.write("Deduplicating...")
+
+                    # Convert metadata to TileParticleManager format
+                    mgr_metadata = []
+                    for i, tm in enumerate(st.session_state.tile_metadata):
+                        mgr_metadata.append({
+                            "id": i,
+                            "filename": tm["filename"],
+                            "x_start": tm.get("x", 0),
+                            "y_start": tm.get("y", 0),
+                            "x_end": tm.get("x", 0) + tm.get("width", 3000),
+                            "y_end": tm.get("y", 0) + tm.get("height", 3000),
+                            "neighbors": tm.get("neighbors", {})
+                        })
+
+                    # Save temp metadata for manager
+                    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+                        json.dump(mgr_metadata, f)
+                        metadata_file = f.name
+
+                    # Deduplicate
+                    manager = TileParticleManager(metadata_file, iou_threshold=0.3, seam_margin=30)
+                    dedup_particles, stats = manager.process_tile_particles(raw_particles)
+
+                    st.write(f"✅ After dedup: {stats['after_dedup']}")
+                    st.write(f"   Removed: {stats['duplicates_removed']}")
+                    st.write(f"   At seams: {stats['at_seams']}")
+
+                    st.session_state.results = dedup_particles
+
+                except ImportError:
+                    st.warning("TileParticleManager not found, using raw detections")
+                    st.session_state.results = raw_particles
+                except Exception as e:
+                    st.error(f"Deduplication error: {e}")
+                    st.write("Using raw detections")
+                    st.session_state.results = raw_particles
+
                 st.session_state.undo_stack = []
                 st.session_state.selected_particles = set()
-                st.success(f"Found {len(particles)} particles")
+                st.success(f"Done!")
 
     st.divider()
 
@@ -308,7 +354,7 @@ else:
 
     st.subheader("🖼️ Particle Gallery")
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     with col1:
         filter_class = st.multiselect(
             "Class:",
@@ -317,19 +363,23 @@ else:
             key="fc"
         )
     with col2:
-        filter_method = st.multiselect(
-            "Sizing Method:",
-            ["edge_detect", "mask_bounds", "bbox"],
-            default=["edge_detect", "mask_bounds", "bbox"],
-            key="fm"
+        filter_bins = st.multiselect(
+            "Size Bin:",
+            [b[0] for b in SIZE_BINS],
+            default=[b[0] for b in SIZE_BINS],
+            key="fb"
         )
     with col3:
+        show_seams_only = st.checkbox("Seams only")
+    with col4:
         items_per_page = st.selectbox("Per page:", [12, 18, 24, 36], index=0)
 
     # Filter particles
     all_particles = []
     for idx, p in enumerate(st.session_state.results):
-        if not p.get("deleted") and p["class"] in filter_class and p["size_method"] in filter_method:
+        if not p.get("deleted") and p["class"] in filter_class and p["size_bin"] in filter_bins:
+            if show_seams_only and not p.get("at_seam"):
+                continue
             all_particles.append((idx, p))
 
     if all_particles:
@@ -374,19 +424,26 @@ else:
 
                 crop = tile_img[y1:y2, x1:x2].copy()
 
-                # Draw green box
+                # Draw bright blue box
                 crop_pil = Image.fromarray(crop).convert('RGB')
                 draw = ImageDraw.Draw(crop_pil)
-                draw.rectangle([(x-x1, y-y1), (x+w-x1, y+h-y1)], outline=(75, 145, 255), width=2)
+                draw.rectangle([(x-x1, y-y1), (x+w-x1, y+h-y1)], outline=(0, 100, 255), width=2)
                 crop = np.array(crop_pil)
 
                 # Display
                 st.image(crop, use_column_width=True)
 
-                # Caption with sizing method
+                # Caption with size bin and sizing method
                 method = p["size_method"]
                 method_icon = {"edge_detect": "✨", "mask_bounds": "📊", "bbox": "📦"}
-                st.caption(f"{p['class']} {method_icon.get(method, '?')}\n{p['diameter_um']:.1f}µm\n({method})")
+
+                caption = f"{p['class']} | {p['size_bin']}\n{p['diameter_um']:.1f}µm\n({method})"
+
+                # Add seam warning if applicable
+                if p.get("at_seam"):
+                    caption += f"\n⚠️ At seams: {p.get('seams', [])}"
+
+                st.caption(caption)
 
                 # Checkbox
                 key = f"sel_{pidx}"
@@ -440,16 +497,16 @@ else:
                     fig = go.Figure()
                     fig.add_trace(go.Image(z=tile_img, name="Image"))
 
-                    # Highlight particle
+                    # Highlight particle with bright blue box
                     x, y, w, h = p["x"], p["y"], p["w"], p["h"]
                     fig.add_shape(
                         type="rect",
                         x0=x, y0=y, x1=x + w, y1=y + h,
-                        line=dict(color="lime", width=3)
+                        line=dict(color="rgb(0, 100, 255)", width=3)
                     )
 
                     fig.update_layout(
-                        title=f"{filename} | {p['class']} ({p['diameter_um']}µm) [{p['size_method']}]",
+                        title=f"{filename} | {p['class']} ({p['size_bin']}) {p['diameter_um']}µm [{p['size_method']}]",
                         showlegend=False,
                         hovermode="closest",
                         margin=dict(b=0, l=0, r=0, t=40),
