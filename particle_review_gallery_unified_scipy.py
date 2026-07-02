@@ -45,17 +45,20 @@ SIZE_BINS = [
     ("J: 1000μm+", 1000, float("inf")),
 ]
 
+
 @st.cache_resource
 def load_model():
     if not os.path.exists(MODEL_PATH):
         return None
     return YOLO(MODEL_PATH)
 
+
 def get_size_bin(diameter_um):
     for label, lo, hi in SIZE_BINS:
         if lo <= diameter_um < hi:
             return label
     return "K"
+
 
 def load_tile_metadata(tiles_dir):
     """Load tile metadata from manifest.json"""
@@ -67,6 +70,7 @@ def load_tile_metadata(tiles_dir):
         return manifest.get("tiles", [])
     else:
         return None
+
 
 def detect_particles_in_tiles(tile_metadata, model, tile_images_cache):
     """Detect particles in all tiles"""
@@ -137,6 +141,7 @@ def detect_particles_in_tiles(tile_metadata, model, tile_images_cache):
     status.empty()
     return all_tile_particles
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SESSION STATE
 # ─────────────────────────────────────────────────────────────────────────────
@@ -152,8 +157,10 @@ if "tile_metadata" not in st.session_state:
 if "tile_images_cache" not in st.session_state:
     st.session_state.tile_images_cache = {}
 
+
 def push_undo():
     st.session_state.undo_stack.append(deepcopy(st.session_state.results))
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SIDEBAR
@@ -168,37 +175,87 @@ with st.sidebar:
         zip_file = st.file_uploader("Upload tiles.zip", type=["zip"])
 
         if zip_file and st.button("📋 Extract & Load"):
-            import zipfile
-            import tempfile
+            try:
+                import zipfile
+                import tempfile
 
-            with tempfile.TemporaryDirectory() as tmpdir:
-                with zipfile.ZipFile(zip_file) as z:
-                    z.extractall(tmpdir)
+                st.write("📦 Extracting ZIP...")
 
-                # Find manifest.json
-                manifest_path = None
-                for root, dirs, files in os.walk(tmpdir):
-                    if "manifest.json" in files:
-                        manifest_path = os.path.join(root, "manifest.json")
-                        break
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    try:
+                        with zipfile.ZipFile(zip_file) as z:
+                            z.extractall(tmpdir)
+                        st.write(f"✅ Extracted to {tmpdir}")
+                    except Exception as e:
+                        st.error(f"❌ ZIP extraction failed: {e}")
+                        st.stop()
 
-                if manifest_path:
-                    with open(manifest_path) as f:
-                        manifest = json.load(f)
+                    # Find manifest.json
+                    st.write("🔍 Looking for manifest.json...")
+                    manifest_path = None
+                    for root, dirs, files in os.walk(tmpdir):
+                        if "manifest.json" in files:
+                            manifest_path = os.path.join(root, "manifest.json")
+                            st.write(f"✅ Found at: {manifest_path}")
+                            break
 
-                    tile_metadata = manifest.get("tiles", [])
+                    if not manifest_path:
+                        st.error("❌ manifest.json not found in ZIP")
+                        st.write(f"Files in ZIP: {os.listdir(tmpdir)}")
+                        st.stop()
 
-                    # Cache tile images
-                    for tile in tile_metadata:
-                        tile_path = os.path.join(os.path.dirname(manifest_path), tile["filename"])
-                        if os.path.exists(tile_path):
-                            img = Image.open(tile_path).convert('RGB')
-                            st.session_state.tile_images_cache[tile["filename"]] = np.array(img)
+                    # Load manifest
+                    try:
+                        with open(manifest_path) as f:
+                            manifest = json.load(f)
+                        st.write(f"✅ Manifest loaded: {type(manifest)}")
+                    except Exception as e:
+                        st.error(f"❌ Manifest parse error: {e}")
+                        st.stop()
 
+                    # Get tiles
+                    try:
+                        if isinstance(manifest, dict):
+                            tile_metadata = manifest.get("tiles", [])
+                        else:
+                            tile_metadata = manifest
+
+                        st.write(f"✅ Found {len(tile_metadata)} tiles")
+                    except Exception as e:
+                        st.error(f"❌ Error reading tiles: {e}")
+                        st.stop()
+
+                    # Cache tiles
+                    try:
+                        manifest_dir = os.path.dirname(manifest_path)
+                        cached_count = 0
+
+                        for tile in tile_metadata:
+                            tile_path = os.path.join(manifest_dir, tile["filename"])
+                            if os.path.exists(tile_path):
+                                try:
+                                    img = Image.open(tile_path).convert('RGB')
+                                    st.session_state.tile_images_cache[tile["filename"]] = np.array(img)
+                                    cached_count += 1
+                                except Exception as e:
+                                    st.warning(f"Failed to cache {tile['filename']}: {e}")
+                            else:
+                                st.warning(f"Tile file not found: {tile_path}")
+
+                        st.write(f"✅ Cached {cached_count}/{len(tile_metadata)} tiles")
+                    except Exception as e:
+                        st.error(f"❌ Caching error: {e}")
+                        st.stop()
+
+                    # Store metadata
                     st.session_state.tile_metadata = tile_metadata
-                    st.success(f"✅ Loaded {len(tile_metadata)} tiles")
-                else:
-                    st.error("manifest.json not found in ZIP")
+                    st.success(f"✅ Loaded {len(tile_metadata)} tiles from ZIP")
+
+            except Exception as e:
+                st.error(f"❌ Unexpected error: {e}")
+                import traceback
+
+                st.write(traceback.format_exc())
 
     else:  # Individual tiles
         tile_files = st.file_uploader(
@@ -210,18 +267,58 @@ with st.sidebar:
 
         if tile_files and manifest_file and st.button("📋 Load"):
             try:
-                manifest = json.load(manifest_file)
-                tile_metadata = manifest.get("tiles", [])
+                # Load manifest
+                try:
+                    manifest = json.load(manifest_file)
+                    st.write(f"✅ Manifest loaded: {type(manifest)}")
+                except Exception as e:
+                    st.error(f"❌ Manifest parse error: {e}")
+                    st.write(manifest_file.read())
+                    st.stop()
 
-                # Cache uploaded tiles
-                for tile_file in tile_files:
-                    img = Image.open(tile_file).convert('RGB')
-                    st.session_state.tile_images_cache[tile_file.name] = np.array(img)
+                # Get tiles list
+                try:
+                    if isinstance(manifest, dict):
+                        tile_metadata = manifest.get("tiles", [])
+                    elif isinstance(manifest, list):
+                        tile_metadata = manifest
+                    else:
+                        st.error(f"Unknown manifest format: {type(manifest)}")
+                        st.stop()
 
-                st.session_state.tile_metadata = tile_metadata
-                st.success(f"✅ Loaded {len(tile_metadata)} tiles")
+                    st.write(f"✅ Found {len(tile_metadata)} tiles in manifest")
+                except Exception as e:
+                    st.error(f"❌ Error reading tiles: {e}")
+                    st.stop()
+
+                # Cache tiles
+                try:
+                    cached_count = 0
+                    for tile_file in tile_files:
+                        try:
+                            img = Image.open(tile_file).convert('RGB')
+                            st.session_state.tile_images_cache[tile_file.name] = np.array(img)
+                            cached_count += 1
+                        except Exception as e:
+                            st.warning(f"Failed to cache {tile_file.name}: {e}")
+
+                    st.write(f"✅ Cached {cached_count}/{len(tile_files)} tiles")
+                except Exception as e:
+                    st.error(f"❌ Caching error: {e}")
+                    st.stop()
+
+                # Store metadata
+                try:
+                    st.session_state.tile_metadata = tile_metadata
+                    st.success(f"✅ Loaded {len(tile_metadata)} tiles")
+                except Exception as e:
+                    st.error(f"❌ Storage error: {e}")
+
             except Exception as e:
-                st.error(f"Error: {e}")
+                st.error(f"❌ Unexpected error: {e}")
+                import traceback
+
+                st.write(traceback.format_exc())
 
     st.divider()
 
@@ -244,6 +341,7 @@ with st.sidebar:
 
                 # Save metadata temporarily for TileParticleManager
                 import tempfile
+
                 with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
                     # Convert to TileParticleManager format
                     mgr_metadata = []
