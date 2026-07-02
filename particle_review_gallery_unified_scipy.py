@@ -29,7 +29,7 @@ from copy import deepcopy
 import plotly.graph_objects as go
 from scipy import ndimage
 
-st.set_page_config(page_title="tiled dirt sniffer", layout="wide")
+st.set_page_config(page_title="tiled dirt sniffer", page_icon="icon.ico", layout="wide")
 st.title("🐕 tiled_dirt_sniffer: Review Dashboard")
 
 # CONFIG
