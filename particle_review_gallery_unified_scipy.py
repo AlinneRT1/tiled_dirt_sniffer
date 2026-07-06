@@ -49,17 +49,20 @@ SIZE_BINS = [
     ("J: 1000μm+ (0 pcs)", 1000, float("inf")),
 ]
 
+
 @st.cache_resource
 def load_model():
     if not os.path.exists(MODEL_PATH):
         return None
     return YOLO(MODEL_PATH)
 
+
 def get_size_bin(diameter_um):
     for label, lo, hi in SIZE_BINS:
         if lo <= diameter_um < hi:
             return label
     return "K"
+
 
 def calculate_particle_size_accurate(mask_array, calibration):
     """Edge detection sizing"""
@@ -87,6 +90,7 @@ def calculate_particle_size_accurate(mask_array, calibration):
         pass
 
     return None, "failed"
+
 
 def calculate_merged_particle_size(stitched_image, calibration):
     """Recalculate size on the complete stitched image using edge detection"""
@@ -117,6 +121,7 @@ def calculate_merged_particle_size(stitched_image, calibration):
         pass
 
     return None, "failed"
+
 
 def stitch_merged_particle(tile_files, p, calibration=CALIBRATION_UM_PER_PIXEL):
     """Stitch together tiles for a merged cut particle and recalculate size"""
@@ -170,6 +175,7 @@ def stitch_merged_particle(tile_files, p, calibration=CALIBRATION_UM_PER_PIXEL):
         }, seam_position
     except:
         return None, None, None
+
 
 def detect_particles_in_tiles(tile_files, tile_metadata, model):
     """Detect in all tiles (loads from uploaded files)"""
@@ -245,6 +251,7 @@ def detect_particles_in_tiles(tile_files, tile_metadata, model):
     status.empty()
     return all_particles
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SESSION STATE
 # ─────────────────────────────────────────────────────────────────────────────
@@ -260,8 +267,10 @@ if "tile_metadata" not in st.session_state:
 if "tile_files" not in st.session_state:
     st.session_state.tile_files = {}
 
+
 def push_undo():
     st.session_state.undo_stack.append(deepcopy(st.session_state.results))
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SIDEBAR
@@ -341,9 +350,12 @@ with st.sidebar:
                     # Create manager
                     manager = TileParticleManager(metadata_file, iou_threshold=0.3, seam_margin=30)
 
-                    # Mark seams CORRECTLY using TileParticleManager's is_at_seam()
-                    # This properly handles tile-local → mosaic coordinate conversion
+                    # Mark seams with SIMPLE DIRECT method
+                    # Just check if particle is within seam_margin pixels of tile edges
                     seam_marked = []
+                    seams_found = 0
+                    seam_margin = 30
+
                     for p in raw_particles:
                         tile_id = p.get("tile_id", 0)
                         x = p.get("x", 0)
@@ -351,12 +363,40 @@ with st.sidebar:
                         w = p.get("w", 0)
                         h = p.get("h", 0)
 
-                        # Use manager's is_at_seam method (proper coordinate handling)
-                        seam_info = manager.is_at_seam(tile_id, x, y, w, h)
-                        p["at_seam"] = seam_info["at_seam"]
-                        p["seams"] = seam_info["seams"]
+                        # Get tile dimensions from metadata
+                        tile_w = 0
+                        tile_h = 0
+                        if tile_id < len(st.session_state.tile_metadata):
+                            tm = st.session_state.tile_metadata[tile_id]
+                            tile_w = tm.get("width", 3000)
+                            tile_h = tm.get("height", 3000)
+
+                        # Check each edge
+                        seams = []
+                        at_seam = False
+
+                        if x < seam_margin:
+                            seams.append("left")
+                            at_seam = True
+                        if x + w > tile_w - seam_margin:
+                            seams.append("right")
+                            at_seam = True
+                        if y < seam_margin:
+                            seams.append("top")
+                            at_seam = True
+                        if y + h > tile_h - seam_margin:
+                            seams.append("bottom")
+                            at_seam = True
+
+                        p["at_seam"] = at_seam
+                        p["seams"] = seams
+
+                        if at_seam:
+                            seams_found += 1
 
                         seam_marked.append(p)
+
+                    st.write(f"✅ Found {seams_found} particles at seams")
 
                     # Now merge the cut particles
                     st.write("Merging cut particle pieces...")
@@ -374,18 +414,18 @@ with st.sidebar:
                         st.write(f"""
                         **Raw detections:** {len(raw_particles)}
                         (all particles detected across all tiles - NONE REMOVED)
-                        
+
                         **Seam particles identified:** {num_at_seam}
                         (particles at tile edges, potentially cut)
-                        
+
                         **Merged pairs:** {len(merged_pairs)}
                         (cut pieces stitched together into complete particles)
-                        
+
                         **Final unique particles:** {len(merged_particles)}
                         = Raw detections (nothing removed)
                         - Merged piece pairs (61 pieces → 30 complete)
                         = {len(raw_particles)} - {len(merged_pairs)} = {len(merged_particles)}
-                        
+
                         **Key point:** NO particles removed. All {len(raw_particles)} 
                         detections are preserved. Only cut pieces were merged.
                         """)
@@ -396,13 +436,13 @@ with st.sidebar:
                         - Tiles are placed side-by-side with no overlapping regions
                         - Mosaic is 49536×46872 with 2800px tiles
                         - Example: Tile A (x=0-2800) → Tile B (x=2800-5600)
-                        
+
                         **What Happens: Merging ONLY (No Removal)**
-                        
+
                         Since your tiles don't overlap:
                         ❌ NO IOU deduplication (no duplicate complete particles)
                         ✅ YES positional matching & merging (cut particles only)
-                        
+
                         **The Merging Process:**
                         1. All particles are detected in all tiles → no removal
                         2. Particles at tile seams are marked as `at_seam=True`
@@ -410,12 +450,12 @@ with st.sidebar:
                         4. If particle found at same Y-position and similar size → MERGE them
                         5. Both halves combined into ONE complete particle
                         6. Complete particle reported with recalculated size
-                        
+
                         **Why this matters:**
                         - Without merging: count particle twice (once per half) ❌ WRONG
                         - With merging: count particle once (complete) ✅ CORRECT
                         - All particles kept: no false positives removed
-                        
+
                         **Confidence:**
                         - Cut particles identified by: proximity to seam + matching neighbors
                         - Merged particles show COMPLETE size on stitched image
@@ -455,7 +495,8 @@ with st.sidebar:
             rows = []
             for p in st.session_state.results:
                 if not p.get("deleted"):
-                    status = "MERGED (stitched)" if p.get("merged") else ("AT_SEAM (check)" if p.get("at_seam") else "OK")
+                    status = "MERGED (stitched)" if p.get("merged") else (
+                        "AT_SEAM (check)" if p.get("at_seam") else "OK")
 
                     # If merged, try to get recalculated size
                     diameter_um = p["diameter_um"]
@@ -467,7 +508,8 @@ with st.sidebar:
                             particle_key = f"{p.get('tile_filename')}_{p.get('x')}_{p.get('y')}"
 
                             if particle_key not in st.session_state.stitch_cache:
-                                stitched, merged_meta, seam_info = stitch_merged_particle(st.session_state.tile_files, p)
+                                stitched, merged_meta, seam_info = stitch_merged_particle(st.session_state.tile_files,
+                                                                                          p)
                                 if merged_meta:
                                     st.session_state.stitch_cache[particle_key] = merged_meta
 
@@ -518,7 +560,7 @@ else:
         data[cls] = {}
         for b, _, _ in SIZE_BINS:
             count = len([p for p in st.session_state.results
-                        if p["class"] == cls and p["size_bin"] == b and not p.get("deleted")])
+                         if p["class"] == cls and p["size_bin"] == b and not p.get("deleted")])
             data[cls][b] = count
 
     rows = []
@@ -625,7 +667,7 @@ else:
                     # Draw bright blue box
                     crop_pil = Image.fromarray(crop).convert('RGB')
                     draw = ImageDraw.Draw(crop_pil)
-                    draw.rectangle([(x-x1, y-y1), (x+w-x1, y+h-y1)], outline=(0, 100, 255), width=2)
+                    draw.rectangle([(x - x1, y - y1), (x + w - x1, y + h - y1)], outline=(0, 100, 255), width=2)
                     crop = np.array(crop_pil)
 
                     # Display
@@ -792,7 +834,8 @@ else:
                                         with c1:
                                             st.write(f"**Class:** {p.get('class', '?')}")
                                         with c2:
-                                            st.write(f"**Size (recalc):** {merged_metadata.get('diameter_um', '?')}µm ({merged_metadata.get('size_bin', '?')})")
+                                            st.write(
+                                                f"**Size (recalc):** {merged_metadata.get('diameter_um', '?')}µm ({merged_metadata.get('size_bin', '?')})")
                                         with c3:
                                             st.write(f"**Method:** {merged_metadata.get('size_method', '?')}")
                                         with c4:
@@ -823,8 +866,8 @@ else:
                                 h = p.get("h", 0)
 
                                 if x and y and w and h:
-                                    fig.add_shape(type="rect", x0=x, y0=y, x1=x+w, y1=y+h,
-                                               line=dict(color="rgb(0, 100, 255)", width=3))
+                                    fig.add_shape(type="rect", x0=x, y0=y, x1=x + w, y1=y + h,
+                                                  line=dict(color="rgb(0, 100, 255)", width=3))
 
                                 fig.update_layout(
                                     title=f"{filename} | {p.get('class', '?')} ({p.get('size_bin', '?')}) {p.get('diameter_um', '?')}µm",
