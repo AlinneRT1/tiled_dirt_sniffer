@@ -341,42 +341,20 @@ with st.sidebar:
                     # Create manager
                     manager = TileParticleManager(metadata_file, iou_threshold=0.3, seam_margin=30)
 
-                    # IMPORTANT: Mark seams directly WITHOUT calling process_tile_particles()
-                    # which does IOU removal. We want to keep ALL particles.
+                    # Mark seams CORRECTLY using TileParticleManager's is_at_seam()
+                    # This properly handles tile-local → mosaic coordinate conversion
                     seam_marked = []
                     for p in raw_particles:
-                        p["at_seam"] = False
-                        p["seams"] = []
-
-                        # Check if near seam by comparing to tile boundaries
                         tile_id = p.get("tile_id", 0)
-                        if tile_id < len(st.session_state.tile_metadata):
-                            tm = st.session_state.tile_metadata[tile_id]
-                            x_start = tm.get("x", 0)
-                            y_start = tm.get("y", 0)
-                            x_end = x_start + tm.get("width", 3000)
-                            y_end = y_start + tm.get("height", 3000)
-                            seam_margin = 30
+                        x = p.get("x", 0)
+                        y = p.get("y", 0)
+                        w = p.get("w", 0)
+                        h = p.get("h", 0)
 
-                            # Particle boundaries
-                            p_x = p.get("x", 0)
-                            p_y = p.get("y", 0)
-                            p_x2 = p_x + p.get("w", 0)
-                            p_y2 = p_y + p.get("h", 0)
-
-                            # Check each edge
-                            if abs(p_x2 - x_end) < seam_margin:
-                                p["at_seam"] = True
-                                p["seams"].append("right")
-                            if abs(p_x - x_start) < seam_margin:
-                                p["at_seam"] = True
-                                p["seams"].append("left")
-                            if abs(p_y2 - y_end) < seam_margin:
-                                p["at_seam"] = True
-                                p["seams"].append("bottom")
-                            if abs(p_y - y_start) < seam_margin:
-                                p["at_seam"] = True
-                                p["seams"].append("top")
+                        # Use manager's is_at_seam method (proper coordinate handling)
+                        seam_info = manager.is_at_seam(tile_id, x, y, w, h)
+                        p["at_seam"] = seam_info["at_seam"]
+                        p["seams"] = seam_info["seams"]
 
                         seam_marked.append(p)
 
